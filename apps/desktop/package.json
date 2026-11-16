@@ -1,0 +1,13 @@
+{
+  "name": "@sofia/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sofia 桌面客户端（Electron 瘦客户端，经本地 WebSocket 连接 ext-desktop）",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^39.0.0"
+  }
+}

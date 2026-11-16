@@ -1,0 +1,19 @@
+{
+  "name": "@sofia/ext-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@sofia/core": "workspace:*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "~1.5.2",
+    "@types/ws": "^8.5.13"
+  }
+}

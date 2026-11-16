@@ -1,0 +1,3 @@
+# Replies are auto-delivered to the Focus Room; silence is an explicit token
+
+Every finished assistant message's text is delivered to the Run's Focus Room unless the whole text is the Silence Token (`[[NO_REPLY]]`, matched leniently). Explicit `{channel}_send` tools exist alongside for cross-Room speech, and no de-duplication rule links the two: the model decides. We rejected "text is inner monologue, all speech via tools" because weaker models forget the tool call and the common case (answer where you were asked) should need no ceremony. Runs without a Focus Room (internal Signals) never auto-deliver.

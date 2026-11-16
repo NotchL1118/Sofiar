@@ -1,0 +1,6 @@
+export { checkConfig, readConfig, readSecrets, sofiaHome, writeConfig } from "./config.ts"
+export { type Daemon, type DaemonOptions, RESTART_EXIT_CODE, startDaemon } from "./daemon.ts"
+export { loadExtensions } from "./extensions.ts"
+export { acquireLock } from "./lock.ts"
+export { buildModelRuntime } from "./models.ts"
+export { createTerminalExtension } from "./terminal.ts"

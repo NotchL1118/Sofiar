@@ -1,0 +1,3 @@
+# Timeline stored in SQLite, Trace in a separate database
+
+The Timeline is an append-only table in `timeline.db` (SQLite, WAL mode, via `node:sqlite`) rather than a JSONL file. A JSONL file grows without bound, needs hand-rolled segmentation and indexing for by-Room/by-time queries, and is a single point of corruption; SQLite gives transactional, crash-safe appends, indexed queries for memory and admin tooling, and online backup. Trace lives in its own `trace.db` so it can be deleted freely without touching the Timeline. Human readability is recovered with a JSONL export command. Storage is not pluggable.

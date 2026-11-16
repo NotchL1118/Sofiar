@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' ws://127.0.0.1:* ws://localhost:*; style-src 'self' 'unsafe-inline'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sofia 管理</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Sofia</h1>
+  <nav id="tabs">
+    <button data-tab="overview" class="active">概览</button>
+    <button data-tab="extensions">扩展与配置</button>
+    <button data-tab="timeline">Timeline</button>
+    <button data-tab="lanes">泳道图</button>
+  </nav>
+  <span id="conn" class="pill">连接中…</span>
+</header>
+<main>
+  <section id="overview">
+    <div class="row">
+      <div id="status" class="card grow"></div>
+      <div class="card actions">
+        <button id="act-stop">停止当前 Run</button>
+        <button id="act-compact">立即压缩</button>
+        <button id="act-restart" class="danger">重启 daemon</button>
+      </div>
+    </div>
+    <h2>实时事件</h2>
+    <div id="events" class="log"></div>
+  </section>
+  <section id="extensions" hidden>
+    <p class="hint">修改后点「保存配置」，再重启 daemon 生效。</p>
+    <div id="ext-list"></div>
+    <h2>完整配置（JSON）</h2>
+    <textarea id="raw-config" spellcheck="false"></textarea>
+    <div class="bar"><button id="save-config" class="primary">保存配置</button><span id="save-msg"></span></div>
+  </section>
+  <section id="timeline" hidden>
+    <div class="bar">
+      <label>Room <input id="tl-room" placeholder="如 telegram:direct:123"></label>
+      <label>类型 <input id="tl-types" placeholder="signal,assistant,notice"></label>
+      <label>条数 <input id="tl-limit" type="number" value="100" min="1" max="1000"></label>
+      <button id="tl-load">加载</button>
+    </div>
+    <div id="tl-list"></div>
+  </section>
+  <section id="lanes" hidden>
+    <div class="bar">
+      <label>范围 <select id="lane-range"></select></label>
+      <button id="lane-load">刷新</button>
+      <span class="hint">数据来自 trace.db（需启用 ext-trace）。悬停查看详情。</span>
+    </div>
+    <div id="lane-chart"></div>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

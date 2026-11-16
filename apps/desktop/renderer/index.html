@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src ws://127.0.0.1:* ws://localhost:*; img-src 'self' data: blob:; style-src 'self'">
+<title>Sofia</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="stage"><div id="avatar"></div><span id="status" title="未连接"></span></div>
+<div id="log"></div>
+<div id="attachments"></div>
+<form id="form">
+  <textarea id="input" rows="1" placeholder="和她说点什么…（Enter 发送，Shift+Enter 换行，可粘贴图片）"></textarea>
+  <button id="send" type="submit">发送</button>
+  <button id="stop" type="button" title="打断她">停</button>
+</form>
+<script src="avatar.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

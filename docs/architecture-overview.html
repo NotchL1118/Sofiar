@@ -1,0 +1,397 @@
+<meta charset="utf-8">
+<title>Sofia 架构全览</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Noto+Sans+SC:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column (max 1000px); each section = heading, one figure or table, a few notes. Kernel = amber, Extension = blue, throughout. */
+:root{
+  --bg:#f5f6f9; --surface:#ffffff; --fg:#1a1f2c; --muted:#5b6275; --line:#d6dae4;
+  --ext:#2f56b0; --ext-soft:#e5ebfa; --kernel:#a8611a; --kernel-soft:#faefe1; --ok:#2d7a4f;
+  --font-display:"Space Grotesk","Noto Sans SC",system-ui,sans-serif;
+  --font-body:"Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  --font-mono:"JetBrains Mono",ui-monospace,Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#11141b; --surface:#191e29; --fg:#e3e6ee; --muted:#99a1b4; --line:#313949;
+  --ext:#8fa8ff; --ext-soft:#222c4d; --kernel:#eea45a; --kernel-soft:#382819; --ok:#6cc792; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#11141b; --surface:#191e29; --fg:#e3e6ee; --muted:#99a1b4; --line:#313949;
+  --ext:#8fa8ff; --ext-soft:#222c4d; --kernel:#eea45a; --kernel-soft:#382819; --ok:#6cc792; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font-family:var(--font-body);font-size:15px;line-height:1.7}
+.wrap{max-width:1000px;margin:0 auto;padding-block:40px 80px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));display:flex;flex-direction:column;gap:48px}
+h1,h2,h3{font-family:var(--font-display);text-wrap:balance;margin:0;line-height:1.3}
+h1{font-size:34px}
+h2{font-size:22px;display:flex;align-items:baseline;gap:10px}
+h2 .ref{font-family:var(--font-mono);font-size:12px;color:var(--muted);font-weight:400}
+h3{font-size:15px}
+p{margin:0;max-width:68ch}
+section{display:flex;flex-direction:column;gap:14px}
+code,.mono{font-family:var(--font-mono);font-size:.88em}
+code{background:var(--surface);border:1px solid var(--line);border-radius:4px;padding:0 4px}
+.lede{color:var(--muted);font-size:16px}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:13px;color:var(--muted)}
+.sw{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-1px;margin-right:6px}
+.sw.k{background:var(--kernel-soft);border:1.5px solid var(--kernel)}
+.sw.e{background:var(--ext-soft);border:1.5px solid var(--ext)}
+ul{margin:0;padding-left:20px;max-width:72ch}
+li+li{margin-top:4px}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:14px;background:var(--surface);border:1px solid var(--line)}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-family:var(--font-display);font-weight:600;font-size:13px;color:var(--muted);letter-spacing:.02em}
+td:first-child{white-space:nowrap}
+.k{color:var(--kernel)} .e{color:var(--ext)}
+/* topology */
+.topo{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,2.4fr);gap:14px;align-items:stretch}
+.outside{display:flex;flex-direction:column;gap:10px}
+.box{border:1.5px solid var(--line);background:var(--surface);border-radius:8px;padding:10px 14px;min-width:0}
+.box small{display:block;color:var(--muted);font-size:12px;line-height:1.5}
+.daemon{border:1.5px dashed var(--muted);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:12px;min-width:0}
+.daemon>.tag{font-family:var(--font-mono);font-size:12px;color:var(--muted)}
+.kernel{background:var(--kernel-soft);border-color:var(--kernel)}
+.ext{background:var(--ext-soft);border-color:var(--ext)}
+.row{display:flex;flex-wrap:wrap;gap:8px}
+.chip{font-family:var(--font-mono);font-size:12px;padding:3px 8px;border-radius:5px;border:1px solid var(--ext);background:var(--ext-soft);color:var(--fg)}
+.chip.k{border-color:var(--kernel);background:var(--kernel-soft)}
+.store{display:flex;flex-wrap:wrap;gap:8px}
+/* flow */
+.flow{display:flex;flex-wrap:wrap;align-items:stretch;gap:6px}
+.flow .step{flex:1 1 150px;min-width:0}
+.flow .arrow{align-self:center;color:var(--muted);font-family:var(--font-mono)}
+.step b{display:block;font-family:var(--font-display);font-size:14px}
+.step small{color:var(--muted);font-size:12.5px;line-height:1.55;display:block}
+/* timeline lifecycle */
+ol.life{list-style:none;margin:0;padding:0;counter-reset:s;display:flex;flex-direction:column;gap:0;border-left:2px solid var(--line);margin-left:10px}
+ol.life li{counter-increment:s;position:relative;padding:6px 0 12px 22px;margin:0}
+ol.life li::before{content:counter(s);position:absolute;left:-12px;top:6px;width:22px;height:22px;border-radius:50%;background:var(--surface);border:1.5px solid var(--kernel);font:500 11px/19px var(--font-mono);text-align:center;color:var(--kernel)}
+ol.life li.loop::before{content:"↻";border-color:var(--ext);color:var(--ext)}
+ol.life li small{display:block;color:var(--muted);font-size:13px}
+/* context stack */
+.stack{display:flex;flex-direction:column;gap:4px;font-family:var(--font-mono);font-size:13px}
+.stack div{padding:8px 12px;border-radius:6px;border:1px solid var(--line);background:var(--surface);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.stack div span:last-child{color:var(--muted);font-family:var(--font-body);font-size:12.5px}
+.stack .sys{border-color:var(--kernel);background:var(--kernel-soft)}
+pre{margin:0;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:12px 14px;font-family:var(--font-mono);font-size:12.5px;line-height:1.6;overflow-x:auto}
+.terms{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
+.term{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:10px 12px;min-width:0}
+.term b{font-family:var(--font-display);font-size:14px}
+.term b span{font-family:var(--font-body);font-weight:400;color:var(--muted);font-size:12px;margin-left:6px}
+.term p{font-size:13px;color:var(--muted);line-height:1.55;margin-top:2px}
+.grp{font-family:var(--font-display);font-size:12px;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;grid-column:1/-1;margin-top:6px}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
+.cols>div{min-width:0;display:flex;flex-direction:column;gap:8px}
+footer{color:var(--muted);font-size:13px}
+@media (max-width:720px){.topo{grid-template-columns:1fr}.outside{flex-direction:row;flex-wrap:wrap}.outside .box{flex:1 1 140px}.flow .arrow{display:none}}
+</style>
+
+<div class="wrap">
+
+<header style="display:flex;flex-direction:column;gap:10px">
+  <h1>Sofia 架构全览</h1>
+  <p class="lede">一个长期运行的个人陪伴 Agent：一个人格、一条永不结束的 Timeline，同时活在桌面 Live2D、Telegram 等多个 Channel 里。内核只负责 Queue、调度、渲染、Timeline、Agent Loop 和 Hook 分发，其余全部是 Extension。</p>
+  <div class="legend"><span><i class="sw k"></i>内核</span><span><i class="sw e"></i>Extension</span><span class="mono">依赖 @earendil-works/pi-ai · pi-agent-core 1.5.x</span></div>
+  <p style="font-size:13px;color:var(--muted)">本页是 <code>docs/architecture.md</code> 的图示摘要，细节以该文档为准。术语见 <code>GLOSSARY.md</code>，取舍见 <code>docs/adr/</code>。</p>
+</header>
+
+<section>
+  <h2>系统拓扑 <span class="ref">§2</span></h2>
+  <div class="topo">
+    <div class="outside">
+      <div class="box">Electron 客户端<small>Live2D 瘦客户端，本地 WebSocket</small></div>
+      <div class="box">Telegram<small>Bot API 长轮询</small></div>
+      <div class="box">浏览器 admin 页<small>127.0.0.1，配置表单、泳道图</small></div>
+    </div>
+    <div class="daemon">
+      <span class="tag">sofia daemon · 单进程 · Node ≥ 24 · daemon.lock 单实例</span>
+      <div class="row">
+        <span class="chip">ext-desktop</span><span class="chip">ext-telegram</span><span class="chip">ext-admin</span>
+        <span class="chip">ext-persona</span><span class="chip">ext-memory-md</span><span class="chip">ext-compaction</span>
+        <span class="chip">ext-heartbeat</span><span class="chip">ext-trace</span>
+      </div>
+      <div class="box kernel"><b>内核 packages/core</b>
+        <small>Queue · 调度（防抖 / 优先级 / steer）· Signal 渲染 · Timeline · Agent 封装（pi-agent-core 的 Agent 类）· Section 与工具注册表 · Compaction 触发与记账 · Hook 分发 · 只读事件流</small></div>
+      <div class="store">
+        <span class="chip k">timeline.db · 内核独写</span>
+        <span class="chip">trace.db · 可随时删</span>
+        <span class="chip">memory.md</span><span class="chip">persona.md</span>
+        <span class="chip k">config.json + secrets.json</span>
+      </div>
+    </div>
+  </div>
+  <ul>
+    <li>Channel 扩展本身就是适配层：ext-desktop 对 Electron，相当于 Telegram 服务器对 ext-telegram。</li>
+    <li>关掉 Electron 不影响 daemon，Telegram 照常回复。</li>
+    <li>配置和数据都在 <code>~/.sofia/</code>，与代码分离，升级不影响使用。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>术语 <span class="ref">GLOSSARY.md</span></h2>
+  <div class="terms">
+    <div class="grp">身份</div>
+    <div class="term"><b>Owner<span>主人</span></b><p>唯一的主人，由各 Channel 按平台账号 ID 判定。</p></div>
+    <div class="term"><b>Contact<span>联系人</span></b><p>主人以外的人，按 Channel 区分，不跨 Channel 合并。</p></div>
+    <div class="grp">场所</div>
+    <div class="term"><b>Channel</b><p>一种接入方式，提供工具和 Section。Channel id 就是扩展名。</p></div>
+    <div class="term"><b>Room</b><p>Channel 里一个具体对话场所。id 形如 <code>telegram:group:-100123</code>。</p></div>
+    <div class="term"><b>Delivery<span>投递</span></b><p>把回复文本发到 Focus Room。</p></div>
+    <div class="grp">心智</div>
+    <div class="term"><b>Signal</b><p>需要她注意的事：Room 里的发言，或扩展产生的内部念头。</p></div>
+    <div class="term"><b>Queue</b><p>Signal 等待处理的地方，只在内存中。</p></div>
+    <div class="term"><b>Timeline</b><p>唯一、永久、只追加的经历记录，所有 Room 共享。</p></div>
+    <div class="term"><b>Run</b><p>一次连续的思考行动，同一时刻至多一个。</p></div>
+    <div class="term"><b>Turn</b><p>Run 中一次模型回复加其工具调用。</p></div>
+    <div class="term"><b>Focus Room</b><p>Run 所关注的 Room，回复默认发到这里，可以没有。</p></div>
+    <div class="term"><b>Section</b><p>系统提示词里具名、少变的一段。</p></div>
+    <div class="term"><b>Recall<span>召回</span></b><p>Run 开始时写入的“想起来的东西”，供检索式记忆扩展使用。</p></div>
+    <div class="term"><b>Notice<span>旁白</span></b><p>内核写入的旁白：Run 失败、中断、投递失败、被打断。</p></div>
+    <div class="term"><b>Compaction<span>压缩</span></b><p>用摘要替换最旧的工作上下文，Timeline 本身不删。</p></div>
+    <div class="term"><b>Silence Token</b><p>整条回复等于 <code>[[NO_REPLY]]</code> 时表示不说话。</p></div>
+    <div class="term"><b>Trace</b><p>可选的行为观测记录，泳道图的数据源。</p></div>
+    <div class="grp">构件</div>
+    <div class="term"><b>Extension<span>扩展</span></b><p>唯一的插件单位。Channel、人设、记忆、压缩都是扩展。</p></div>
+    <div class="term"><b>Model Role<span>模型角色</span></b><p><code>main</code>、<code>cheap</code> 等用途名，绑定到具体 provider 和模型。</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>一条消息怎么变成一次 Run <span class="ref">§3 §4</span></h2>
+  <div class="flow">
+    <div class="box ext step"><b>Channel 规范化</b><small>平台消息 → Signal：sender、isOwner、Room、优先级、content、notes</small></div>
+    <span class="arrow">→</span>
+    <div class="box kernel step"><b>signal hook</b><small>扩展可修改或丢弃</small></div>
+    <span class="arrow">→</span>
+    <div class="box kernel step"><b>同 Room 正在 Run？</b><small>是：<code>agent.steer()</code>，Turn 结束后注入，不防抖<br>否：进该 Room 的桶</small></div>
+    <span class="arrow">→</span>
+    <div class="box kernel step"><b>防抖</b><small>安静 <code>debounceMs</code>（1500）或从首条起满 <code>maxWaitMs</code>（5000）→ 就绪</small></div>
+    <span class="arrow">→</span>
+    <div class="box kernel step"><b>调度</b><small>空闲时选优先级最高、同级最早的桶，一次取走全部 Signal 开 Run</small></div>
+  </div>
+  <ul>
+    <li>优先级由 Channel 标：主人私聊 <code>high</code>，群聊 <code>normal</code>，内部 Signal <code>low</code>。</li>
+    <li>不抢占：群聊 Run 进行中来了私聊，等它结束后立刻处理。</li>
+    <li>Run 结束时还没注入的 steer：<code>peekQueuedMessages()</code> 取副本再清空，Signal 放回原桶，notice 直接写入 Timeline。</li>
+    <li>每条消息都会唤醒她，回不回由模型决定。</li>
+  </ul>
+  <h3>渲染（内核唯一渲染器）</h3>
+<pre>[群聊·摸鱼小队 · 2026-11-10 23:40] 小王：今天的天气呢
+  （回复了 主人："明天去爬山"）
+[私聊·主人 · 2026-11-10 23:41] 主人（主人）：睡了吗
+&lt;internal from="heartbeat" at="2026-11-11 09:00"&gt;你已经 14 小时没和主人说话了…&lt;/internal&gt;</pre>
+</section>
+
+<section>
+  <h2>Run 生命周期 <span class="ref">§5</span></h2>
+  <ol class="life">
+    <li>记录 <code>runs</code> 表；如有需要或有待压缩标记，先压缩<small>压缩期间调度器等待，视同占用唯一思考流</small></li>
+    <li>从 Timeline 重建 <code>agent.state.messages</code><small>每个 Run 都重建；<code>state.messages</code> 只是工作副本</small></li>
+    <li>设置工具注册表、调用 Section provider，比较差异<small>工具差异由 loop 自动声明 toolsAdded / toolsRemoved；Section 变化才出补丁</small></li>
+    <li><code>run_start</code> hook 收集 recall</li>
+    <li><code>agent.prompt([section 补丁?, recall?, …signals])</code><small>Run 进行中所有消息只经 <code>message_end</code> 落盘</small></li>
+    <li class="loop">Turn：流式回复 → 自动投递 → 工具执行 → <code>turn_end</code> → 注入 steer → 必要时 Turn 间压缩<small>Turn 上限 <code>maxTurnsPerRun</code> 默认不限制</small></li>
+    <li><code>agent_end</code> → 更新 runs 状态 → <code>run_end</code> → 处理残留 → 调度下一个</li>
+  </ol>
+  <div class="cols">
+    <div>
+      <h3>自动投递 <span class="ref mono" style="font-weight:400;color:var(--muted)">ADR-0004</span></h3>
+      <ul>
+        <li>每条 assistant 消息结束时投递其文本，thinking 不投递。</li>
+        <li>整条去掉首尾空白和方括号、忽略大小写后等于 <code>NO_REPLY</code> 就不发。</li>
+        <li>没有 Focus Room 不投递。显式 <code>{扩展名}_send</code> 工具并存，不去重。</li>
+        <li>不 await；同 Room 串成一条发送链保序。</li>
+        <li>流式时，已有文本可能还是 Silence Token 开头就先扣住。</li>
+      </ul>
+    </div>
+    <div>
+      <h3>出错与中止</h3>
+      <ul>
+        <li>流式重试只在第一个内容事件之前，默认 3 次。</li>
+        <li>Run 失败：写 notice，调用 <code>onRunError</code> 告诉 Room，Signal 不重放。</li>
+        <li>只把“她以为成功、实际失败”的事告诉她：投递持续失败时，Run 中 steer 注入 notice，已结束就写入 Timeline，不唤醒新 Run。</li>
+        <li><code>sofia.abortRun()</code>：desktop 停止按钮、Telegram <code>/stop</code>、admin。写 notice「主人打断了你」。</li>
+        <li>hook 超时：默认 10s，压缩相关 120s。</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>一次模型请求的上下文 <span class="ref">§6 §7</span></h2>
+  <div class="stack">
+    <div class="sys"><span>system：kernel · persona · memory · channel:telegram · channel:desktop …</span><span>Section，少变，保 prompt cache</span></div>
+    <div class="sys"><span>tools：telegram_send · desktop_expression · desktop_motion …</span><span>Run 开始时生效，不随 Room 变</span></div>
+    <div><span>user：&lt;summary&gt; 交接简报</span><span>最近一次压缩的摘要</span></div>
+    <div><span>最近约 20k token 原文（signal / assistant / toolResult / notice）</span><span>切点落在 Run 边界</span></div>
+    <div><span>user：&lt;recall&gt;… + 本次 Signal（合并为一条）</span><span>每个 Run 都变，放 user 消息</span></div>
+  </div>
+  <ul>
+    <li>规则：很少变的放 Section，每个 Run 都变的放 user 消息。</li>
+    <li>系统提示词也存在 Timeline 里：首条全量，之后只追加差异补丁（pi-ai 1.5 的 SystemMessage sections）。</li>
+    <li>工具名由内核自动加 <code>{扩展名}_</code> 前缀，扩展只写动作名，天然不重名。</li>
+    <li>error / aborted 的 assistant 条目由 pi-ai 发送时跳过，内核只在估算 token 时排除。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>压缩 <span class="ref">§7.3</span></h2>
+  <div class="flow">
+    <div class="box kernel step"><b>触发</b><small>超过 窗口 − 16k；或溢出；或 <code>sofia.compact()</code> 主动触发</small></div>
+    <span class="arrow">→</span>
+    <div class="box kernel step"><b>选切点</b><small>保留最近 20k token，落在 Run 边界</small></div>
+    <span class="arrow">→</span>
+    <div class="box ext step"><b>before_compact</b><small>ext-compaction 返回 summary（cheap 模型），首个生效；可 cancel</small></div>
+    <span class="arrow">→</span>
+    <div class="box kernel step"><b>写 compaction 条目</b></div>
+    <span class="arrow">→</span>
+    <div class="box ext step"><b>compacted</b><small>内核 await，所有扩展收到；ext-memory-md 在此增量编辑 memory.md</small></div>
+    <span class="arrow">→</span>
+    <div class="box kernel step"><b>rebuild</b><small>重取所有 Section，写全量 system 检查点</small></div>
+  </div>
+  <ul>
+    <li>摘要失败（出错或超时）：和 pi 一样，这次不压缩、上下文不变，下次检查点再触发。</li>
+    <li>一个压缩扩展都没启用时才兜底：丢弃切点前的内容。</li>
+    <li>溢出恢复：<code>isContextOverflow</code> → 强制压缩 → 重建 → <code>agent.continue()</code>，只试一次。</li>
+    <li>memory Section 只在 rebuild 时刷新，两次压缩之间系统提示词字节不变（ADR-0006）。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Hook 与事件流 <span class="ref">§8</span></h2>
+  <p>需要返回值、或内核必须等它完成的做成 hook；只需知道“发生了什么”的只放事件流。hook 按 config 里扩展的顺序执行。</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Hook</th><th>时机</th><th>返回值</th></tr></thead>
+    <tbody>
+      <tr><td><code>start</code> / <code>shutdown</code></td><td>daemon 启停</td><td>—</td></tr>
+      <tr><td><code>signal</code></td><td>Signal 入 Queue 前</td><td>修改后的 Signal，或 <code>{drop:true}</code>；链式</td></tr>
+      <tr><td><code>run_start</code></td><td>Run 开始、写入 Signal 前</td><td><code>{recall?}</code>；各扩展合并</td></tr>
+      <tr><td><code>context</code></td><td>每次 LLM 请求前</td><td><code>{messages}</code>；链式，不写入 Timeline</td></tr>
+      <tr><td><code>tool_call</code> / <code>tool_result</code></td><td>工具执行前 / 后</td><td>拦截 / 部分替换结果</td></tr>
+      <tr><td><code>turn_end</code> / <code>run_end</code></td><td>Turn / Run 结束</td><td>—</td></tr>
+      <tr><td><code>before_compact</code></td><td>压缩触发</td><td><code>{summary}</code> 或 <code>{cancel:true}</code>；首个生效</td></tr>
+      <tr><td><code>compacted</code></td><td>compaction 条目写入后、rebuild 前</td><td>—（内核 await）</td></tr>
+      <tr><td><code>deliver</code></td><td>自动投递前</td><td><code>{text}</code> 或 <code>{cancel:true}</code></td></tr>
+    </tbody>
+  </table></div>
+  <h3>SofiaAPI 主要接口</h3>
+<pre>defineExtension({ name: "telegram", configSchema, setup(sofia) { … } })   // name 全局唯一，/^[a-z][a-z0-9-]{0,23}$/
+
+sofia.on(event, handler)            sofia.events.subscribe(fn)        // hook / 只读事件流
+sofia.registerChannel({ deliver, onDelta?, onRunError?, debounceMs?, maxWaitMs? })
+sofia.registerTool(tool)       → { name: "telegram_send", unregister() }
+sofia.registerSection(name, ({ reason: "run" | "rebuild" }) => string | null)
+sofia.signal({...})                 sofia.complete("cheap", context)
+sofia.timeline.query({...})         sofia.currentRun()
+sofia.abortRun()                    sofia.compact()
+sofia.host.{ extensions, readConfig, writeConfig, restart }          // 给 ext-admin</pre>
+</section>
+
+<section>
+  <h2>存储 <span class="ref">§7.1 ADR-0003</span></h2>
+  <div class="cols">
+    <div>
+      <h3 class="k">timeline.db（内核独写，SQLite WAL）</h3>
+      <ul>
+        <li><code>entries</code>：seq、id、at、type、run_id、room、data（JSON），只追加。</li>
+        <li>条目类型：system · signal · recall · assistant · toolResult · notice · compaction。</li>
+        <li><code>runs</code>：focus_room、开始结束时间、status（ok / error / aborted / interrupted）。</li>
+        <li>扩展只能 <code>timeline.query</code> 只读。</li>
+      </ul>
+    </div>
+    <div>
+      <h3>启动恢复 <span class="ref mono" style="font-weight:400;color:var(--muted)">§7.4</span></h3>
+      <ul>
+        <li>从最近的 compaction 重建上下文，再比较 Section 和工具差异。</li>
+        <li>未结束的 Run 标为 interrupted，写 notice「你刚才被中断了」，不重放。</li>
+        <li>Queue 只在内存，崩溃时排队中的 Signal 会丢失，这是接受的风险。</li>
+      </ul>
+    </div>
+  </div>
+<pre>~/.sofia/
+  config.json   secrets.json   persona.md   memory.md
+  timeline.db   trace.db       ext/&lt;name&gt;/   daemon.lock</pre>
+</section>
+
+<section>
+  <h2>官方扩展 <span class="ref">§10</span></h2>
+  <div class="scroll"><table>
+    <thead><tr><th>扩展</th><th>做什么</th></tr></thead>
+    <tbody>
+      <tr><td><code>ext-persona</code></td><td>读 persona.md，作为 <code>persona</code> Section；隐私约束也写在这里</td></tr>
+      <tr><td><code>ext-memory-md</code></td><td><code>memory</code> Section（rebuild 时刷新）；在 <code>compacted</code> 时用 cheap 模型对 memory.md 做增量编辑</td></tr>
+      <tr><td><code>ext-compaction</code></td><td><code>before_compact</code> 返回“交接简报”：近期按 Room 的事、未完成的约定、主人状态与情绪、各 Room 关键人物近况</td></tr>
+      <tr><td><code>ext-telegram</code></td><td>私聊 / 群 Room；isOwner 按 user id；<code>telegram_send</code>；<code>/stop</code> 中止</td></tr>
+      <tr><td><code>ext-desktop</code></td><td>WebSocket 服务端，Room <code>desktop:direct:main</code>；客户端连上后注册 <code>desktop_expression</code> / <code>desktop_motion</code></td></tr>
+      <tr><td><code>ext-heartbeat</code></td><td>cron 或空闲 N 小时产生内部 Signal，默认目标为主人最近活跃的私聊 Room</td></tr>
+      <tr><td><code>ext-trace</code></td><td>订阅事件流写入 trace.db，默认不存完整 payload</td></tr>
+      <tr><td><code>ext-admin</code></td><td>本地 HTTP/WS：扩展管理、按 configSchema 生成配置表单、重启、停止 Run、立即压缩、泳道图</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>配置示例 <span class="ref">§9</span></h2>
+<pre>{
+  "providers": {
+    "anthropic": { "secret": "ANTHROPIC_API_KEY" },
+    "my-proxy":  { "api": "openai-completions", "baseUrl": "https://example.com/v1", "secret": "PROXY_KEY" }
+  },
+  "models": {
+    "main":  { "provider": "anthropic", "id": "claude-sonnet-4-6" },
+    "cheap": { "provider": "my-proxy",  "id": "deepseek-chat" }
+  },
+  "kernel": { "maxTurnsPerRun": null, "compaction": { "reserveTokens": 16384, "keepRecentTokens": 20000 } },
+  "extensions": [ { "use": "@sofia/ext-persona" }, { "use": "@sofia/ext-telegram", "config": { "ownerUserId": 123456 } }, … ]
+}</pre>
+  <p style="font-size:13px;color:var(--muted)">extensions 的顺序同时决定 hook 顺序和 Section 顺序。改配置后 v1 整体重启生效。</p>
+</section>
+
+<section>
+  <h2>仓库结构与实施顺序 <span class="ref">§2.2 §13</span></h2>
+  <div class="cols">
+<pre>packages/
+  core/  daemon/
+  ext-persona/  ext-memory-md/  ext-compaction/
+  ext-telegram/ ext-desktop/    ext-heartbeat/
+  ext-trace/    ext-admin/
+apps/
+  desktop/      admin-web/</pre>
+    <ol style="margin:0;padding-left:20px">
+      <li>core + 假 Channel + daemon，终端跑通单人格多 Room</li>
+      <li>ext-persona、ext-compaction、ext-memory-md</li>
+      <li>ext-telegram</li>
+      <li>ext-trace、ext-heartbeat</li>
+      <li>ext-desktop + apps/desktop（Live2D）</li>
+      <li>ext-admin + apps/admin-web</li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <h2>关键决策 <span class="ref">docs/adr</span></h2>
+  <div class="scroll"><table>
+    <tbody>
+      <tr><td class="mono">0001</td><td>一个人格、一条 Timeline、同一时刻一个 Run；接受跨 Room 上下文泄露</td></tr>
+      <tr><td class="mono">0002</td><td>基于 pi-ai + pi-agent-core 自写内核，只借鉴 pi-coding-agent 的 hook 形状</td></tr>
+      <tr><td class="mono">0003</td><td>Timeline 用 SQLite，Trace 单独一个库</td></tr>
+      <tr><td class="mono">0004</td><td>回复自动投递到 Focus Room，沉默用 Silence Token</td></tr>
+      <tr><td class="mono">0005</td><td>Channel 规范化，内核统一渲染</td></tr>
+      <tr><td class="mono">0006</td><td>memory.md 在压缩时增量编辑，只在 rebuild 时刷新进提示词</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>v1 明确不做 <span class="ref">§14</span></h2>
+  <ul>
+    <li>多 Agent、并行 Run、抢占</li>
+    <li>跨 Channel 合并 Contact；ownerOnly 工具权限；私聊内容过滤；正文防伪造</li>
+    <li>可插拔存储；Queue 持久化；单扩展热重载；自定义渲染器 hook</li>
+    <li>向量或全文检索记忆；记忆更新失败后的补做</li>
+    <li>图片存文件引用、旧图降级为文字</li>
+    <li>Timeline 分支</li>
+  </ul>
+</section>
+
+<footer>Sofia v1 设计 · 2026-11-12</footer>
+</div>

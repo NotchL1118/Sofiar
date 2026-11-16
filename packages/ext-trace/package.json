@@ -1,0 +1,17 @@
+{
+  "name": "@sofia/ext-trace",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@sofia/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "~1.5.2"
+  }
+}

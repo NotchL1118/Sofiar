@@ -1,0 +1,26 @@
+{
+  "name": "@sofia/daemon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": { "sofia": "./src/cli.ts" },
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "start": "node src/cli.ts start",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "~1.5.2",
+    "@sofia/core": "workspace:*",
+    "@sofia/ext-admin": "workspace:*",
+    "@sofia/ext-compaction": "workspace:*",
+    "@sofia/ext-desktop": "workspace:*",
+    "@sofia/ext-heartbeat": "workspace:*",
+    "@sofia/ext-memory-md": "workspace:*",
+    "@sofia/ext-persona": "workspace:*",
+    "@sofia/ext-telegram": "workspace:*",
+    "@sofia/ext-trace": "workspace:*",
+    "jiti": "^2.7.0"
+  }
+}
