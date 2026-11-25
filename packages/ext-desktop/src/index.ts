@@ -124,11 +124,11 @@ export default defineExtension<DesktopConfig>({
       }
     }
 
-    /** 浏览器里的任意网页都能连 localhost；它们无法伪造 Origin，所以拒绝未列入的 http(s) 来源。 */
+    /** Electron 自带页面使用 file://；浏览器的不透明来源会发送字符串 "null"。 */
     const originAllowed = (req: IncomingMessage) => {
       const origin = req.headers.origin
-      if (!origin || !/^https?:\/\//i.test(origin)) return true
-      return (config.allowedOrigins ?? []).includes(origin)
+      if (origin === undefined || origin === "file://") return true
+      return /^https?:\/\//i.test(origin) && (config.allowedOrigins ?? []).includes(origin)
     }
 
     sofia.on("start", async () => {

@@ -103,7 +103,7 @@ footer{color:var(--muted);font-size:13px}
       <div class="box">浏览器 admin 页<small>127.0.0.1，配置表单、泳道图</small></div>
     </div>
     <div class="daemon">
-      <span class="tag">sofia daemon · 单进程 · Node ≥ 24 · daemon.lock 单实例</span>
+      <span class="tag">sofia daemon · 单进程 · Node ≥ 24 · SQLite 单实例锁</span>
       <div class="row">
         <span class="chip">ext-desktop</span><span class="chip">ext-telegram</span><span class="chip">ext-admin</span>
         <span class="chip">ext-persona</span><span class="chip">ext-memory-md</span><span class="chip">ext-compaction</span>
@@ -184,11 +184,10 @@ footer{color:var(--muted);font-size:13px}
 <section>
   <h2>Run 生命周期 <span class="ref">§5</span></h2>
   <ol class="life">
-    <li>记录 <code>runs</code> 表；如有需要或有待压缩标记，先压缩<small>压缩期间调度器等待，视同占用唯一思考流</small></li>
-    <li>从 Timeline 重建 <code>agent.state.messages</code><small>每个 Run 都重建；<code>state.messages</code> 只是工作副本</small></li>
-    <li>设置工具注册表、调用 Section provider，比较差异<small>工具差异由 loop 自动声明 toolsAdded / toolsRemoved；Section 变化才出补丁</small></li>
-    <li><code>run_start</code> hook 收集 recall</li>
-    <li><code>agent.prompt([section 补丁?, recall?, …signals])</code><small>Run 进行中所有消息只经 <code>message_end</code> 落盘</small></li>
+    <li>记录 <code>runs</code> 表，从 Timeline 重建本轮历史</li>
+    <li>读取本轮 Section 和可用工具<small>与历史比较，将变化的 Section 和工具声明放入同一条 system 补丁</small></li>
+    <li><code>run_start</code> 收集一次 Recall，与历史、system 补丁和新 Signal 一起检查预算<small>超过阈值时压缩历史，按新检查点刷新补丁，沿用本轮 Recall</small></li>
+    <li><code>agent.prompt([system 补丁?, recall?, …signals])</code><small>交给 loop 的消息经 <code>message_end</code> 写入 Timeline</small></li>
     <li class="loop">Turn：流式回复 → 自动投递 → 工具执行 → <code>turn_end</code> → 注入 steer → 必要时 Turn 间压缩<small>Turn 上限 <code>maxTurnsPerRun</code> 默认不限制</small></li>
     <li><code>agent_end</code> → 更新 runs 状态 → <code>run_end</code> → 处理残留 → 调度下一个</li>
   </ol>
@@ -236,11 +235,11 @@ footer{color:var(--muted);font-size:13px}
 <section>
   <h2>压缩 <span class="ref">§7.3</span></h2>
   <div class="flow">
-    <div class="box kernel step"><b>触发</b><small>超过 窗口 − 16k；或溢出；或 <code>sofia.compact()</code> 主动触发</small></div>
+    <div class="box kernel step"><b>触发</b><small>超过主模型窗口减预留量，或发生溢出、主动请求压缩</small></div>
     <span class="arrow">→</span>
-    <div class="box kernel step"><b>选切点</b><small>保留最近 20k token，落在 Run 边界</small></div>
+    <div class="box kernel step"><b>选切点</b><small>按主模型的近期保留量选切点，默认约 20k token</small></div>
     <span class="arrow">→</span>
-    <div class="box ext step"><b>before_compact</b><small>ext-compaction 返回 summary（cheap 模型），首个生效；可 cancel</small></div>
+    <div class="box ext step"><b>before_compact</b><small>ext-compaction 默认用 main 生成摘要，首个有效结果生效</small></div>
     <span class="arrow">→</span>
     <div class="box kernel step"><b>写 compaction 条目</b></div>
     <span class="arrow">→</span>
@@ -249,8 +248,8 @@ footer{color:var(--muted);font-size:13px}
     <div class="box kernel step"><b>rebuild</b><small>重取所有 Section，写全量 system 检查点</small></div>
   </div>
   <ul>
-    <li>摘要失败（出错或超时）：和 pi 一样，这次不压缩、上下文不变，下次检查点再触发。</li>
-    <li>一个压缩扩展都没启用时才兜底：丢弃切点前的内容。</li>
+    <li>摘要出错、超时或被输出上限截断时，如果后续扩展也没有提供摘要，保留当前上下文。</li>
+    <li>没有扩展提供摘要或报告错误，且压缩未取消时，沿用旧摘要，移出切点前的原文。</li>
     <li>溢出恢复：<code>isContextOverflow</code> → 强制压缩 → 重建 → <code>agent.continue()</code>，只试一次。</li>
     <li>memory Section 只在 rebuild 时刷新，两次压缩之间系统提示词字节不变（ADR-0006）。</li>
   </ul>
@@ -309,7 +308,7 @@ sofia.host.{ extensions, readConfig, writeConfig, restart }          // 给 ext-
   </div>
 <pre>~/.sofia/
   config.json   secrets.json   persona.md   memory.md
-  timeline.db   trace.db       ext/&lt;name&gt;/   daemon.lock</pre>
+  timeline.db   trace.db       ext/&lt;name&gt;/   daemon.lock   daemon-lock.db</pre>
 </section>
 
 <section>
@@ -340,7 +339,13 @@ sofia.host.{ extensions, readConfig, writeConfig, restart }          // 给 ext-
     "main":  { "provider": "anthropic", "id": "claude-sonnet-4-6" },
     "cheap": { "provider": "my-proxy",  "id": "deepseek-chat" }
   },
-  "kernel": { "maxTurnsPerRun": null, "compaction": { "reserveTokens": 16384, "keepRecentTokens": 20000 } },
+  "kernel": {
+    "maxTurnsPerRun": null,
+    "compaction": {
+      "reserveTokens": 16384, "keepRecentTokens": 20000,
+      "modelOverrides": { "anthropic/claude-sonnet-4-6": { "reserveTokens": 125000 } }
+    }
+  },
   "extensions": [ { "use": "@sofia/ext-persona" }, { "use": "@sofia/ext-telegram", "config": { "ownerUserId": 123456 } }, … ]
 }</pre>
   <p style="font-size:13px;color:var(--muted)">extensions 的顺序同时决定 hook 顺序和 Section 顺序。改配置后 v1 整体重启生效。</p>

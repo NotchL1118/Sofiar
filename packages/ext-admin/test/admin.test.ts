@@ -56,6 +56,7 @@ async function boot() {
 
 it("托管静态文件；读写配置（校验失败 400）；扩展列表；停止 / 压缩 / 重启", async () => {
   const t = await boot()
+  expect((await t.call("GET", "/progress-50%.html")).status).toBe(400)
   expect(await t.call("GET", "/")).toEqual({ status: 200, body: "<h1>admin</h1>" })
   expect((await t.call("GET", "/../../etc/passwd")).status).toBe(404)
   expect((await t.call("GET", "/api/extensions")).body.map((e: any) => [e.name, e.status])).toEqual([["trace", "loaded"], ["admin", "loaded"]])

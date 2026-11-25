@@ -1,4 +1,5 @@
-import { spawnSync } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
+import { once } from "node:events"
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -7,7 +8,7 @@ import { fileURLToPath } from "node:url"
 import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai"
 import { createModelRuntime } from "@sofia/core"
 import { describe, expect, it } from "vitest"
-import { acquireLock, buildModelRuntime, checkConfig, createTerminalExtension, startDaemon } from "../src/index.ts"
+import { acquireLock, buildModelRuntime, checkConfig, createTerminalExtension, readSecrets, startDaemon } from "../src/index.ts"
 
 const tmp = () => mkdtempSync(join(tmpdir(), "sofia-daemon-"))
 const tick = (ms = 20) => new Promise((r) => setTimeout(r, ms))
@@ -46,9 +47,62 @@ describe("单实例锁", () => {
     expect(readFileSync(join(home, "daemon.lock"), "utf8")).toBe(String(process.pid))
     again()
   })
+
+  it("并发启动只有一个进程获得锁，持有者被强制终止后可立即接管", async () => {
+    const home = tmp()
+    const path = join(home, "daemon.lock")
+    writeFileSync(path, "")
+    const worker = `
+      const { acquireLock } = await import(process.argv[1])
+      let release
+      process.on("message", () => {
+        try {
+          release = acquireLock(process.argv[2])
+          process.send("acquired")
+        } catch (e) {
+          process.send(e.message)
+        }
+      })
+      process.on("disconnect", () => release?.())
+      process.send("ready")
+    `
+    const module = new URL("../src/lock.ts", import.meta.url).href
+    const children = Array.from({ length: 3 }, () =>
+      spawn(process.execPath, ["--input-type=module", "-e", worker, module, home], { stdio: ["ignore", "ignore", "inherit", "ipc"] }),
+    )
+    try {
+      await Promise.all(children.map((child) => once(child, "message")))
+      const results = await Promise.all(children.map((child) => {
+        const message = once(child, "message")
+        child.send("start")
+        return message
+      }))
+      const winners = children.filter((_, i) => results[i]?.[0] === "acquired")
+      expect(winners).toHaveLength(1)
+      expect(results.filter(([result]) => String(result).includes("already running"))).toHaveLength(2)
+      const winner = winners[0]!
+      expect(readFileSync(path, "utf8")).toBe(String(winner.pid))
+      const exited = once(winner, "exit")
+      winner.kill("SIGKILL")
+      await exited
+      const release = acquireLock(home)
+      expect(readFileSync(path, "utf8")).toBe(String(process.pid))
+      release()
+      expect(existsSync(path)).toBe(false)
+    } finally {
+      for (const child of children) if (child.connected) child.disconnect()
+    }
+  })
 })
 
 describe("配置", () => {
+  it("密钥文件格式错误时只报告路径和原因", () => {
+    const home = tmp()
+    const path = join(home, "secrets.json")
+    writeFileSync(path, "invalid example")
+    expect(() => readSecrets(home)).toThrow(new Error(`${path}: invalid JSON`))
+  })
+
   it("checkConfig 报出各类问题", () => {
     expect(checkConfig(baseConfig)).toEqual([])
     expect(checkConfig({})).toEqual(["models.main is required"])
@@ -79,6 +133,20 @@ describe("配置", () => {
     expect(main).toMatchObject({ thinking: "low", model: { id: "deepseek-chat", provider: "my-proxy", api: "openai-completions", contextWindow: 128000, maxTokens: 8192, baseUrl: "https://example.com/v1" } })
     expect(runtime.resolve("cheap")).toBe(main)
     expect(() => buildModelRuntime({ models: { main: { provider: "anthropic", id: "no-such-model" } } }, {})).toThrow(/has no model "no-such-model"/)
+  })
+
+  it("检查压缩预算与逐模型覆盖，允许单字段覆盖和带斜线的模型 ID", () => {
+    const check = (compaction: unknown) => checkConfig({ ...baseConfig, kernel: { compaction } })
+    expect(check({ modelOverrides: { "router/vendor/chat": { keepRecentTokens: 0 } } })).toEqual([])
+    expect(check({ reserveTokens: -1, modelOverrides: { "router/chat": { keepRecentTokens: 2.5 } } })).toEqual([
+      "kernel.compaction.reserveTokens must be a non-negative safe integer",
+      'kernel.compaction.modelOverrides["router/chat"].keepRecentTokens must be a non-negative safe integer',
+    ])
+    expect(check({ modelOverrides: [] })).toEqual(["kernel.compaction.modelOverrides must be an object"])
+    expect(check({ modelOverrides: { "router/": null } })).toEqual([
+      'kernel.compaction.modelOverrides["router/"] key must be provider/modelId',
+      'kernel.compaction.modelOverrides["router/"] must be an object',
+    ])
   })
 })
 

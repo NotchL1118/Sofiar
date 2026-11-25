@@ -1,9 +1,9 @@
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai"
-import { describe, expect, it } from "vitest"
-import { defineExtension, type HookMap, type SofiaAPI } from "../src/index.ts"
+import { createAssistantMessageEventStream, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai"
+import { describe, expect, it, vi } from "vitest"
+import { defineExtension, estimateContextTokens, type HookMap, type SofiaAPI } from "../src/index.ts"
 import { deferred, fakeChannel, room, say, setup, tick, userText } from "./harness.ts"
 
 const main = room("main")
@@ -23,6 +23,18 @@ function summarizer(onCompact?: (p: HookMap["before_compact"]["payload"]) => voi
       }),
   })
   return { ext, calls }
+}
+
+function stalledSummarizer() {
+  const started = deferred<AbortSignal>()
+  const ext = defineExtension({
+    name: "slow",
+    setup: (s) => void s.on("before_compact", ({ signal }) => {
+      started.resolve(signal)
+      return new Promise<never>(() => {})
+    }),
+  })
+  return { ext, started: started.promise }
 }
 
 async function chat(t: ReturnType<typeof setup>, ch: ReturnType<typeof fakeChannel>, n: number, from = 1) {
@@ -82,6 +94,51 @@ describe("Compaction", () => {
     expect(ch.delivered).toHaveLength(4)
   })
 
+  it.each([
+    { when: "下一个 Run", restart: false },
+    { when: "重启后的第一个 Run", restart: true },
+  ])("手动压缩后，$when 按重建上下文和新消息判断阈值", async ({ restart }) => {
+    const home = mkdtempSync(join(tmpdir(), "sofia-compaction-"))
+    const dbPath = join(home, "timeline.db")
+    const ch = fakeChannel()
+    const sum = summarizer()
+    const boot = () => setup({
+      home, dbPath, extensions: [sum.ext, ch.ext], faux: small.faux,
+      config: { compaction: { reserveTokens: 750, keepRecentTokens: 350 } },
+    })
+    let t = boot()
+    const exchange = async (question: string, answer: string) => {
+      t.reply(answer)
+      ch.api.signal(say(main, question))
+      await t.kernel.whenIdle()
+    }
+    await t.kernel.start()
+    const shortQuestion = "q".repeat(176) // 含来源、时间和发言人，共 58 token
+    await exchange("q".repeat(800), "a".repeat(2072))
+    await exchange(shortQuestion, "a".repeat(1228))
+    ch.api.compact()
+    await t.kernel.whenIdle()
+    expect(t.of("compaction")).toMatchObject([{ reason: "manual", ok: true, tokensBefore: 1209, tokensAfter: 720 }])
+
+    if (restart) {
+      await t.kernel.stop()
+      t = boot()
+      await t.kernel.start()
+    }
+    const previousEvents = t.of("compaction").length
+    await exchange(shortQuestion, "好")
+    const ctx = t.kernel.timeline.loadContext()
+    expect(estimateContextTokens(ctx.messages.slice(0, -1), ctx.usageStartIndex)).toBe(778)
+    expect(t.of("compaction")).toHaveLength(previousEvents)
+    expect(ch.delivered.at(-1)?.text).toBe("好")
+
+    const freshUsage = t.of("llm_request").at(-1)!.tokens
+    await exchange("q".repeat(5000), "收到")
+    expect(t.of("compaction").at(-1)).toMatchObject({ reason: "threshold", ok: true, tokensBefore: freshUsage })
+    expect(t.entries(["compaction"])).toHaveLength(2)
+    await t.kernel.stop()
+  })
+
   it("previousSummary 迭代传入；无压缩扩展时沿用旧摘要兜底", async () => {
     const ch = fakeChannel()
     const sum = summarizer()
@@ -135,6 +192,48 @@ describe("Compaction", () => {
     expect(t.entries(["compaction"]).map((e) => (e.data as any).summary)).toEqual(["来自 a"])
   })
 
+  it("摘要超时只中止该扩展的请求，后续扩展仍可提供摘要", async () => {
+    const ch = fakeChannel()
+    const slow = stalledSummarizer()
+    const fallback = summarizer(({ signal }) => signal.throwIfAborted())
+    const t = setup({
+      extensions: [slow.ext, fallback.ext, ch.ext],
+      config: { compaction: { keepRecentTokens: 200 }, compactHookTimeoutMs: 20 },
+    })
+    await t.kernel.start()
+    await chat(t, ch, 2)
+    ch.api.compact()
+    await t.kernel.whenIdle()
+    expect((await slow.started).aborted).toBe(true)
+    expect(t.of("hook")).toContainEqual(expect.objectContaining({ event: "before_compact", ext: "slow", error: "timeout" }))
+    expect(t.of("compaction")).toMatchObject([{ ok: true, by: "compaction" }])
+    await t.kernel.stop()
+  })
+
+  it.each(["owner", "shutdown"] as const)("%s 中止压缩，跳过后续摘要扩展", async (reason) => {
+    const ch = fakeChannel()
+    const slow = stalledSummarizer()
+    const fallback = summarizer()
+    const t = setup({ ...small, extensions: [slow.ext, fallback.ext, ch.ext] })
+    await t.kernel.start()
+    for (const runId of ["one", "two", "three"]) {
+      t.kernel.timeline.append({ type: "user", runId, data: { role: "user", content: long(runId).repeat(3), timestamp: 0 } })
+    }
+    if (reason === "owner") ch.api.signal(say(main, "继续"))
+    else ch.api.compact()
+    const signal = await slow.started
+    if (reason === "owner") {
+      ch.api.abortRun()
+      await t.kernel.whenIdle()
+      expect(t.of("run_end")).toMatchObject([{ status: "aborted" }])
+      expect(t.entries(["compaction"])).toHaveLength(0)
+    }
+    await t.kernel.stop()
+    expect(signal.aborted).toBe(true)
+    expect(fallback.calls).toHaveLength(0)
+    expect(t.of("compaction")).toMatchObject([{ ok: false, error: "aborted" }])
+  })
+
   it("Turn 之间压缩：在 Turn 边界切，工具调用与结果不被拆开", async () => {
     const ch = fakeChannel()
     const sum = summarizer()
@@ -171,6 +270,52 @@ describe("Compaction", () => {
     expect(t.entries(["system"])).toHaveLength(2)
   })
 
+  it.each(["threshold", "overflow"] as const)("%s 压缩后在同一 Run 再次调用工具，零 usage 不会触发重复压缩", async (reason) => {
+    const ch = fakeChannel()
+    const sum = summarizer()
+    const reader = defineExtension({
+      name: "reader",
+      setup(s) {
+        s.registerTool({
+          name: "read", label: "读", description: "读", parameters: { type: "object", properties: {} },
+          execute: async () => ({ content: [{ type: "text", text: "x".repeat(600) }], details: undefined }),
+        })
+      },
+    })
+    const t = setup({
+      extensions: [sum.ext, reader, ch.ext], faux: small.faux,
+      config: { compaction: { reserveTokens: 750, keepRecentTokens: 350 } },
+    })
+    await t.kernel.start()
+    await chat(t, ch, 2)
+
+    // 每个工具结果 150 token。第一条 usage 加上结果，按场景决定是否在此时跨过 1250。
+    const toolCall = () => fauxAssistantMessage([fauxToolCall("reader_read", {})], { stopReason: "toolUse" })
+    const first = toolCall()
+    const used = reason === "threshold" ? 1200 : 1000
+    first.usage = { ...first.usage, input: used, totalTokens: used }
+    const replies = [first]
+    if (reason === "overflow") {
+      replies.push(fauxAssistantMessage([], { stopReason: "error", errorMessage: "prompt is too long: 2100 tokens > 2000 maximum" }))
+    }
+    replies.push(toolCall()) // 模拟压缩后的模型回复带工具调用，但没有回报用量
+    const stream = vi.spyOn(t.runtime, "stream")
+    for (const message of replies) {
+      stream.mockImplementationOnce(() => {
+        const result = createAssistantMessageEventStream()
+        if (message.stopReason === "error") result.push({ type: "error", reason: "error", error: message })
+        else result.push({ type: "done", reason: "toolUse", message })
+        return result
+      })
+    }
+    t.reply("查完了")
+    ch.api.signal(say(main, "查一下"))
+    await t.kernel.whenIdle()
+    expect(t.of("compaction")).toMatchObject([{ reason, ok: true, tokensBefore: used + 150 }])
+    expect(ch.delivered.at(-1)?.text).toBe("查完了")
+    await t.kernel.stop()
+  })
+
   it("溢出 → 强制压缩 → continue 重试；run_end 只触发一次", async () => {
     const ch = fakeChannel()
     const sum = summarizer()
@@ -192,6 +337,70 @@ describe("Compaction", () => {
     expect(retry.some((m) => m.role === "assistant" && m.stopReason === "error")).toBe(false)
     expect(userText(retry)).toContain("<summary>")
     expect(t.entries(["notice"])).toHaveLength(0)
+  })
+
+  it("溢出压缩完成时 Run 已被中止，保留检查点并跳过重试与投递", async () => {
+    const ch = fakeChannel()
+    const cancel = defineExtension({ name: "cancel", setup: (s) => void s.on("compacted", () => s.abortRun()) })
+    const t = setup({ extensions: [cancel, ch.ext], config: { compaction: { keepRecentTokens: 1 } } })
+    await t.kernel.start()
+    t.kernel.timeline.append({ type: "user", runId: "past", data: { role: "user", content: "较早的提问", timestamp: 0 } })
+    t.reply(fauxAssistantMessage([], { stopReason: "error", errorMessage: "prompt is too long: 300000 tokens > 200000 maximum" }), "重试的回答")
+    ch.api.signal(say(main, "本次提问"))
+    await t.kernel.whenIdle()
+
+    expect(t.of("compaction")).toMatchObject([{ ok: true, reason: "overflow" }])
+    expect(t.kernel.timeline.loadContext().missingCheckpoint).toBe(false)
+    expect(t.of("run_end")).toMatchObject([{ status: "aborted" }])
+    expect(t.requests).toHaveLength(1)
+    expect(ch.delivered).toHaveLength(0)
+    await t.kernel.stop()
+  })
+
+  it.each([0, 200])("单条未回答的请求超过保留量 %i 时，溢出不会把它丢掉再重试", async (keepRecentTokens) => {
+    const ch = fakeChannel()
+    const sum = summarizer()
+    const t = setup({ extensions: [sum.ext, ch.ext], config: { compaction: { keepRecentTokens } } })
+    await t.kernel.start()
+    t.reply(fauxAssistantMessage([], { stopReason: "error", errorMessage: "prompt is too long: 300000 tokens > 200000 maximum" }))
+    ch.api.signal(say(main, "问".repeat(300)))
+    await t.kernel.whenIdle()
+
+    expect(t.of("compaction")).toMatchObject([{ ok: false, reason: "overflow" }])
+    expect(sum.calls).toHaveLength(0)
+    expect(t.kernel.timeline.loadContext().entries.filter((e) => e.type === "signal")).toHaveLength(1)
+    expect(t.of("run_end")).toMatchObject([{ status: "error" }])
+    expect(t.of("llm_request")).toHaveLength(1)
+    expect(ch.delivered).toHaveLength(0)
+    await t.kernel.stop()
+  })
+
+  it.each([false, true])("工具结果超过保留量，只有旧 Run 可供兜底压缩时才重试（有历史：%s）", async (hasHistory) => {
+    const ch = fakeChannel()
+    const t = setup({ extensions: [ch.ext], config: { compaction: { keepRecentTokens: 200 } } })
+    await t.kernel.start()
+    if (hasHistory) t.kernel.timeline.append({ type: "user", runId: "past", data: { role: "user", content: "旧问题", timestamp: 0 } })
+    ch.api.registerTool({
+      name: "read", label: "读", description: "读", parameters: { type: "object", properties: {} },
+      execute: async () => ({ content: [{ type: "text", text: "文".repeat(300) }], details: undefined }),
+    })
+    t.reply(
+      fauxAssistantMessage([fauxToolCall("fake_read", {})], { stopReason: "toolUse" }),
+      fauxAssistantMessage([], { stopReason: "error", errorMessage: "prompt is too long: 300000 tokens > 200000 maximum" }),
+      "查完了",
+    )
+    ch.api.signal(say(main, "本次提问"))
+    await t.kernel.whenIdle()
+
+    expect(t.of("compaction")).toMatchObject([{ ok: hasHistory, reason: "overflow" }])
+    expect(t.of("run_end")).toMatchObject([{ status: hasHistory ? "ok" : "error" }])
+    expect(t.requests).toHaveLength(hasHistory ? 3 : 2)
+    expect(ch.delivered).toHaveLength(hasHistory ? 1 : 0)
+    const lastRequest = t.requests.at(-1)!
+    expect(userText(lastRequest)).toContain("本次提问")
+    expect(userText(lastRequest)).not.toContain("旧问题")
+    expect(lastRequest.slice(-2)).toMatchObject([{ role: "assistant" }, { role: "toolResult", content: [{ text: "文".repeat(300) }] }])
+    await t.kernel.stop()
   })
 
   it("溢出后压缩不了：Run 以 error 结束", async () => {

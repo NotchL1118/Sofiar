@@ -161,30 +161,30 @@ export default defineExtension<AdminConfig>({
         res.writeHead(404, { "content-type": "text/plain" }).end("not found")
         return
       }
-      res.writeHead(200, { "content-type": MIME[extname(file)]!, "cache-control": "no-cache" }).end(readFileSync(file))
+      const content = readFileSync(file)
+      res.writeHead(200, { "content-type": MIME[extname(file)]!, "cache-control": "no-cache" }).end(content)
     }
 
-    const server = createServer((req, res) => {
-      void (async () => {
+    const server = createServer(async (req, res) => {
+      try {
         if (!trusted(req)) return void res.writeHead(403, { "content-type": "text/plain" }).end("forbidden")
-        const url = new URL(req.url ?? "/", `http://${req.headers.host}`)
+        const url = URL.parse(req.url ?? "/", `http://${req.headers.host}`)
+        if (!url) throw new HttpError(400, "invalid URL")
         if (!url.pathname.startsWith("/api/")) {
           if (req.method !== "GET" && req.method !== "HEAD") return void res.writeHead(405).end()
           return serveStatic(res, url.pathname)
         }
-        try {
-          const body = JSON.stringify(await api(req, url), withoutImages)
-          res.writeHead(200, { "content-type": MIME[".json"]!, "cache-control": "no-store" }).end(body)
-        } catch (e) {
-          const status = e instanceof HttpError ? e.status : 500
-          res.writeHead(status, { "content-type": MIME[".json"]! }).end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }))
-        }
-      })()
+        const body = JSON.stringify(await api(req, url), withoutImages)
+        res.writeHead(200, { "content-type": MIME[".json"]!, "cache-control": "no-store" }).end(body)
+      } catch (e) {
+        const status = e instanceof HttpError ? e.status : e instanceof URIError ? 400 : 500
+        res.writeHead(status, { "content-type": MIME[".json"]! }).end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }))
+      }
     })
 
     const wss = new WebSocketServer({ noServer: true })
     server.on("upgrade", (req, socket, head) => {
-      if (!trusted(req) || new URL(req.url ?? "/", "http://x").pathname !== "/api/events") return socket.destroy()
+      if (!trusted(req) || URL.parse(req.url ?? "/", "http://localhost")?.pathname !== "/api/events") return socket.destroy()
       wss.handleUpgrade(req, socket, head, (ws) => {
         sockets.add(ws)
         ws.on("close", () => sockets.delete(ws))

@@ -63,7 +63,7 @@ Sofia 是一个**长期运行的个人陪伴 Agent**：一个人格、一条永�
 ### 2.1 进程
 
 - **daemon**：单个常驻 Node 进程（≥ 24，使用内置 `node:sqlite`；22 上仍为 experimental），包含内核与全部 Extension。
-- **单实例**：启动时在 `SOFIA_HOME` 获取 `daemon.lock`（记录 pid，残留锁检测进程是否存活）；已被占用则拒绝启动，避免两个 daemon 同写 timeline.db、抢 Telegram 长轮询。
+- **单实例**：daemon 在 `SOFIA_HOME/daemon-lock.db` 持有独立的 SQLite 写锁，并发启动时只有一个进程能获取它。进程退出会释放写锁。`daemon.lock` 保留 PID 格式以兼容旧版本，启动时检查并接管已退出进程的残留 PID。
 - **Electron 客户端**：独立进程，瘦客户端，经本地 WebSocket 连接 `ext-desktop`。关掉客户端不影响 daemon。
 - **admin 页面**：浏览器打开 `ext-admin` 托管的本地页面（Electron 也可内嵌）。
 
@@ -100,6 +100,8 @@ v1 不拆独立 `sdk` 包；扩展作者从 `@sofia/core` 引类型。
   memory.md          记忆（ext-memory-md）
   timeline.db        Timeline（内核）
   trace.db           Trace（ext-trace，可随时删除）
+  daemon-lock.db     单实例写锁
+  daemon.lock        正在运行的 daemon PID
   ext/<name>/        各扩展私有数据目录（sofia.dataDir）
 ```
 
@@ -206,9 +208,9 @@ sender.name 去除换行。图片块原样随附。
 ## 5. Run 生命周期
 
 ```
-选中桶 ──► [compaction 检查] ──► Section/工具 diff ──► run_start hook(收集 recall)
-   ──► 写入 Timeline: (system 补丁?) → recall? → signal × N
-   ──► agent.prompt([...])
+选中桶 ──► 从 Timeline 重建上下文 ──► 准备本轮 Section、工具和 Recall
+   ──► 连同新 Signal 检查压缩阈值 ──► 必要时压缩历史、刷新 Section 补丁
+   ──► agent.prompt([system 补丁?, recall?, …signals]) ──► 初始消息依次落盘
         └─ Turn: LLM 流式 → message_end(assistant) → Delivery
                  → 工具执行(tool_call/tool_result hook) → turn_end hook
                  → steer 注入? → prepareNextTurn(compaction 检查) → 下一 Turn …
@@ -218,18 +220,17 @@ sender.name 去除换行。图片块原样随附。
 ### 5.1 Run 开始
 
 **Timeline 写入规则**：
-- **Run 进行中**，消息只经 pi-agent-core 的 `message_end` 落盘（system 补丁 / signal / recall / notice / assistant / toolResult 全部如此）。原因：loop 会根据 `state.tools` 自动改写或插入工具增删的 system 消息，只有 `message_end` 看到的才是真实 transcript。唯一例外是 Turn 间压缩：`compaction` 条目与其后的全量 system 检查点由内核直接写入（§7.3）。
+- **Run 进行中**，交给 loop 的消息均经 `message_end` 落盘，包括 system 补丁、Signal、Recall、Notice、assistant 和工具结果。loop 会根据本轮可用工具核对 system 消息中的工具增删。发生压缩时，由内核直接写入 `compaction` 条目和随后的全量 system 检查点（§7.3）。
 - **Run 之间**，内核可直接追加条目（`notice`、Run 开始前的 `compaction` 与检查点）——因为每个 Run 开始都会从 Timeline 重建上下文。Run 进行中产生的 notice 先由内核攒着：loop 本来就要进入下一个 Turn 时，经 `prepareNextTurnWithContext` 返回的 `messages` 注入（下个 Turn 前可见，随 `message_end` 落盘）；否则在 Run 结束时直接写入 Timeline。**不用 `agent.steer()`**——steer 会让本该结束的 Run 多跑一个 Turn。
 - `runs` 表由内核直接维护。
 
 步骤：
 
 1. 在 `runs` 表记录 `{id, focusRoom, startedAt}`。
-2. 若需压缩，先执行 Compaction（§7.3）。
-3. **从 Timeline 重建** `agent.state.messages`（§7.3 重建规则）。每个 Run 都重建，保证 Turn 间压缩真正生效（`prepareNextTurnWithContext` 返回的 context 只在当次 loop 内有效，不会回写 `state.messages`）。
-4. 设置 `agent.state.tools` = 工具注册表当前内容（工具差异由 loop 自动声明为 `toolsAdded/toolsRemoved`）；调用所有 Section provider（`reason: "run"`），与当前 system 状态 diff，有变化则构造一条只含 `sections` 的 system 补丁消息。
-5. 触发 `run_start`，收集各扩展返回的 `recall`。
-6. `agent.prompt([sections补丁?, recall?, ...signals])`，这些消息经 `message_end` 落盘。
+2. 从 Timeline 重建本轮历史（§7.3），从注册表读取本轮可用工具。
+3. 取本轮 Section（`reason: "run"`），将 Section 和工具声明与历史中的 system 状态比较，生成需要的补丁。触发一次 `run_start`，收集各扩展返回的 Recall。
+4. 将历史、本轮 system 补丁、Recall 和新 Signal 一起估算。超过阈值时，对 Timeline 中的历史执行 Compaction。成功后基于新检查点重新计算本轮补丁，使压缩期间更新的内容生效。
+5. 把最终的历史装入 `agent.state.messages`，调用 `agent.prompt([system补丁?, recall?, ...signals])`。使用第 3 步取得的 Recall 和原始 Signal，各条消息经 `message_end` 写入一次。
 
 Focus Room：room 桶 → 该 Room；带目标的 internal → 目标 Room；`internal` 桶 → 无。
 
@@ -364,11 +365,12 @@ Recall 渲染：
 - **检查点**：Run 开始前、`prepareNextTurn`（Turn 之间）、上下文溢出错误后。
 - **Turn 间压缩**：`compaction` 条目与全量 system 检查点都由内核直接写入，`prepareNextTurnWithContext` 返回从 Timeline 重建后的 `context`。检查点不能放进返回的 `messages`：pi-ai 只把开头那条 system 当全量，之后的一律按补丁重放，追加在末尾的"全量"会被当成补丁。Run 进行中工具集不变，检查点沿用本 Run 的工具集，与 loop 会声明的一致。该 context 只在当次 loop 有效，下个 Run 开始从 Timeline 重建（§5.1）。
 - **溢出恢复**：溢出在 pi-agent-core 中是硬退出，出错的 assistant 消息已落盘。内核用 `isContextOverflow(msg, contextWindow)` 判定（自定义代理识别不到时按普通错误处理）→ 强制压缩 → 重建 `state.messages` → `agent.continue()` 重试一次，仍属同一个 Run。重建结果不含那条出错的 assistant（见下文重建规则），因此末尾必为 user 或 toolResult——`continue()` 在末尾是 assistant 时会抛异常。第一次 `agent_end` 不算 Run 结束：内核在其中判定溢出并发起重试，只有重试的 `agent_end`（或判定不重试时）才进入 §5.3 的 Run 结束流程，`run_end` 只触发一次。
-- **触发**：估算上下文 token（最近一次 assistant usage + 之后新增内容估算；文本估算按中日韩字符每字 1 token、其余每 4 字符 1 token）> `contextWindow − reserveTokens`（默认 16384）。`contextWindow` 取自 `main` 角色解析出的模型（§9.1）。
-- **切点**：从末尾向前累加，直到达到 `keepRecentTokens`（默认 20000）；切点只落在 **Run 边界**。若最后一个 Run 自身就超出（无论它仍在进行还是已经结束），退化为在 Turn 边界切（保证 assistant 的工具调用与其结果不被拆开）。切点由内核计算，扩展只拿到切点之前的条目。
+- **触发**：上下文估算用量超过 `contextWindow − reserveTokens` 时尝试压缩。窗口和两个 token 预算均按当前 `main` 模型确定（§9.1）。首轮检查包含待发送的本轮消息，压缩事件的 `tokensBefore`、`tokensAfter` 则描述 Timeline 工作上下文在压缩前后的大小。
+- **用量估算**：从最近一次压缩之后的主模型回复中取最后一次有效 usage（成功且用量大于零），加上该回复之后新增消息的估算。首次压缩前可以使用整段历史中的有效 usage。压缩后还没有有效 usage 时，逐条估算当前上下文，包括全量 system 检查点、摘要和保留的近期原文。文本按中日韩字符每字 1 token、其余每 4 字符 1 token 估算。Run 内继续、下一个 Run 和重启重建都按 Timeline 中最新压缩记录区分新旧回复。阈值判断和压缩事件的 `tokensBefore`、`tokensAfter` 对各自的消息列表使用同一估算规则。
+- **切点**：从末尾向前累加至 `keepRecentTokens`（默认 20000），优先按 Run 边界切分。最后一个 Run 自身超过预算时可按 Turn 切分。仍在运行的 Run 至少保留最近一次成功的 assistant 回复、配套的全部工具结果和之后的新输入。尚无成功回复时保留本 Run 的整批输入。即使保留量为零也遵循此规则。没有可切除的历史时，溢出恢复保留原始输入，以本次模型错误结束 Run。
 - **摘要**：触发 `before_compact({ entries, previousSummary, tokensBefore, signal })`，按扩展顺序，第一个返回 `{ summary }` 的生效；返回 `{ cancel: true }` 则本次不压缩。
-- **无压缩扩展时的兜底**：没有任何扩展处理 `before_compact`（一个都没返回）时，沿用 `previousSummary`，丢弃切点之前的内容，保证不会超出窗口。
-- **摘要失败**（扩展出错或超时）：与 pi-coding-agent 相同——本次不压缩、上下文不变，发出 `compaction{error}` 事件，下一个检查点自然会再次触发。溢出恢复只尝试一次压缩加重试，再失败则 Run 以 `error` 结束（走 §5.4）。
+- **无压缩扩展时的兜底**：没有扩展提供新摘要时，沿用 `previousSummary`，仅可丢弃已结束 Run 的历史，当前 Run 的请求和工具结果保留原文。
+- **摘要失败**：摘要扩展报错或超时后，后续扩展仍可提供摘要。若最终失败，内核发出 `compaction{ok:false,error}`，保留当前工作上下文，下次达到阈值时再尝试。溢出恢复只尝试一次压缩加重试，再失败则 Run 以 `error` 结束（走 §5.4）。
 - **写入**：追加 `compaction` 条目 → 触发 `compacted({ entries（被压缩掉的条目）, summary })`，内核 await 全部 handler（与扩展顺序无关）→ 调用所有 Section provider（`reason: "rebuild"`）追加一条**全量** `system` 检查点。因此 `compacted` 中更新的内容（如 memory.md）在 rebuild 时立即生效。
 - **主动触发**：`sofia.compact(reason?)` 设置一个"待压缩"标记。空闲时立即执行；有 Run 时在该 Run 结束后、下一个 Run 开始前执行。压缩执行期间视同占用"唯一思考流"，调度器等待其完成。主动触发不看阈值，但切点规则相同；`before_compact` 的 `reason` 为 `"manual"`（自动为 `"threshold"` / `"overflow"`）。用途：admin "立即压缩"按钮、夜间空闲时提前压缩等。
 - **重建上下文** = 检查点 system → `<summary>` user → `firstKeptSeq` 之后、compaction 条目之前的非 system 条目 → compaction 之后的全部条目；其中 `stopReason` 为 `error` / `aborted` 的 assistant 条目一律剔除。
@@ -490,7 +492,14 @@ pi-agent-core 的原始事件（`agent_start` `turn_start` `turn_end` `message_s
     "main":  { "provider": "anthropic", "id": "claude-sonnet-4-6", "thinking": "low" },
     "cheap": { "provider": "my-proxy",  "id": "deepseek-chat" }
   },
-  "kernel": { "maxTurnsPerRun": null, "compaction": { "reserveTokens": 16384, "keepRecentTokens": 20000 } },
+  "kernel": {
+    "maxTurnsPerRun": null,
+    "compaction": {
+      "reserveTokens": 16384,
+      "keepRecentTokens": 20000,
+      "modelOverrides": { "anthropic/claude-sonnet-4-6": { "reserveTokens": 125000 } }
+    }
+  },
   "extensions": [
     { "use": "@sofia/ext-persona" },
     { "use": "@sofia/ext-memory-md", "config": { "budgetTokens": 1500 } },
@@ -508,6 +517,7 @@ pi-agent-core 的原始事件（`agent_start` `turn_start` `turn_end` `message_s
 - **provider**：内置名直接沿用 pi-ai 的定义；自定义项（含 `api`、`baseUrl`）用 pi-ai `createProvider` 注册。`secret` 指向 `secrets.json` 键名或同名环境变量。
 - **模型元数据跟模型走，不跟 Model Role 走**：内置 provider 不写 `models`，`contextWindow` / `maxTokens` 用 pi-ai 自带的值；自定义 provider **必须**写 `models`，每项必须有 `id`、`contextWindow`、`maxTokens`（原样传给 `createProvider`，示例中的数字仅为占位）。Model Role 引用了该 provider 下不存在的模型 id 视为配置错误，`sofia check` 报出。
 - **models**：Model Role → provider + 模型。主循环用 `main`；扩展用 `sofia.complete(role, …)`；未配置的角色回退到 `main`。
+- **压缩预算**按 `kernel.compaction.modelOverrides` 中精确匹配的 `provider/modelId` 读取。`reserveTokens` 和 `keepRecentTokens` 分别取该模型的值、全局压缩配置、内置默认值（依次优先，默认值分别为 16384、20000）。例如，窗口为 1,000,000 的模型只覆盖 `reserveTokens: 125000` 时，估算用量超过 875,000 才触发压缩，近期原文仍使用全局保留量。手动压缩和溢出恢复也按当时主模型的保留量选切点。
 - **extensions**：有序数组，顺序决定 hook 执行顺序与 Section 顺序。`use` 为包名或本地路径（jiti 加载，TS 免编译）。加载失败：记录、跳过，daemon 继续。
 
 ### 9.2 `secrets.json`
@@ -539,14 +549,14 @@ pi-agent-core 的原始事件（`agent_start` `turn_start` `turn_end` `message_s
 
 ### 10.3 ext-compaction
 
-参考 pi 的 compaction：独立请求（`cheap` 角色，可配置），系统提示为"上下文摘要助手"，带入 `previousSummary` 迭代更新，输出纯文本"交接简报"：
+默认向 `main` 发起独立摘要请求，系统提示为“上下文摘要助手”。每次带入 `previousSummary` 更新交接简报，内容包括以下四项。
 
 1. 近期发生的事（按 Room）
 2. 进行中的话题与未完成的约定
 3. 主人当前的状态与情绪
 4. 各 Room 关键人物近况
 
-摘要提示词可通过配置 `prompt` 或 `promptFile`（相对数据目录）覆盖；`role` 可改用其他 Model Role。请求失败或返回空文本时抛异常，即 §7.3 的"摘要失败"：本次不压缩。条目经内核导出的 `renderEntries` 转写成文本（ext-memory-md 同）。
+摘要提示词可通过 `prompt` 或 `promptFile`（相对数据目录）覆盖。扩展用 `renderEntries` 将待压缩条目转成文本，连同旧摘要和提示词整批发送。设置 `config.role` 可显式选择 `cheap` 等其他角色，其模型窗口需容纳整份输入。请求超窗、失败、中止、返回空白文本或因输出上限截断（`stopReason: "length"`）时，扩展报告摘要失败（§7.3）。
 
 ### 10.4 ext-telegram
 
@@ -575,7 +585,7 @@ pi-agent-core 的原始事件（`agent_start` `turn_start` `turn_end` `message_s
 - 未连接时投递丢弃（记事件）。`onRunError` → 发 `error`。
 - 协议的完整说明（含客户端必须处理的边界情况）与形象层接缝见 [`apps/desktop/README.md`](../apps/desktop/README.md)，以它为准。
 - 可同时连接多个客户端，消息广播给全部；表情/动作以最近一次 `hello` 为准。
-- 只监听 `127.0.0.1`。带 `http(s)://` Origin 的连接（普通网页）默认拒绝，防止任意网页冒充主人说话；开发服务器的来源加入 `allowedOrigins`。
+- 只监听 `127.0.0.1`。默认接受 Electron 的 `file://` 来源和省略 Origin 的本地客户端；HTTP(S) 网页来源须明确加入 `allowedOrigins`。拒绝 `null` 来源。
 - `apps/desktop` 现为基础版：聊天（流式、图片、打断）+ 颜文字占位形象，无构建步骤。Live2D 通过替换 `renderer/avatar.js` 接入。
 
 ### 10.6 ext-heartbeat

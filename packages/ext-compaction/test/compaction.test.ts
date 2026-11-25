@@ -17,7 +17,7 @@ async function chat(t: ReturnType<typeof setup>, ch: ReturnType<typeof fakeChann
   }
 }
 
-it("用 cheap 角色写交接简报，带入 previousSummary 迭代更新；摘要进入下一次上下文", async () => {
+it("用 main 角色写交接简报，带入 previousSummary 迭代更新；摘要进入下一次上下文", async () => {
   const ch = fakeChannel()
   const t = setup({ extensions: [compaction, ch.ext], config: { compaction: { keepRecentTokens: 500 } } })
   await t.kernel.start()
@@ -32,7 +32,7 @@ it("用 cheap 角色写交接简报，带入 previousSummary 迭代更新；摘�
   expect(userText(first)).not.toContain("previous_summary")
   expect(userText(first)).not.toContain("问3")
   expect(t.of("compaction").at(-1)).toMatchObject({ ok: true, by: "compaction", reason: "manual" })
-  expect(t.of("llm_request").at(-1)).toMatchObject({ role: "cheap" })
+  expect(t.of("llm_request").at(-1)).toMatchObject({ role: "main" })
 
   await chat(t, ch, ["4"])
   expect(userText(t.requests.at(-1)!)).toContain("<summary>\n简报一：主人问了 1 和 2。\n</summary>")
@@ -44,18 +44,32 @@ it("用 cheap 角色写交接简报，带入 previousSummary 迭代更新；摘�
   expect(t.entries(["compaction"]).map((e) => (e.data as any).summary)).toEqual(["简报一：主人问了 1 和 2。", "简报二"])
 })
 
-it("摘要请求失败或为空：本次不压缩，上下文不变", async () => {
+it("摘要失败、为空或被截断时保留原上下文，之后可用完整的短摘要压缩", async () => {
   const ch = fakeChannel()
   const t = setup({ extensions: [compaction, ch.ext], config: { compaction: { keepRecentTokens: 500 } } })
   await t.kernel.start()
   await chat(t, ch, ["1", "2", "3"])
-  for (const bad of [fauxAssistantMessage([], { stopReason: "error", errorMessage: "invalid api key" }), fauxAssistantMessage("  ")]) {
+  const before = t.entries()
+  for (const bad of [
+    fauxAssistantMessage([], { stopReason: "error", errorMessage: "invalid api key" }),
+    fauxAssistantMessage("  "),
+    fauxAssistantMessage("她刚答应", { stopReason: "length" }),
+  ]) {
     t.reply(bad)
     ch.api.compact()
     await t.kernel.whenIdle()
   }
-  expect(t.entries(["compaction"])).toHaveLength(0)
-  expect(t.of("compaction").map((e) => e.error)).toEqual(["compaction: invalid api key", "compaction: summary model returned no text"])
+  expect(t.entries()).toEqual(before)
+  expect(t.of("compaction").map((e) => e.error)).toEqual([
+    "compaction: invalid api key",
+    "compaction: summary model returned no text",
+    "compaction: summary reached the output token limit",
+  ])
+
+  t.reply("周六见。")
+  ch.api.compact()
+  await t.kernel.whenIdle()
+  expect(t.entries(["compaction"])).toMatchObject([{ data: { summary: "周六见。" } }])
 })
 
 it("promptFile 覆盖摘要提示词", async () => {

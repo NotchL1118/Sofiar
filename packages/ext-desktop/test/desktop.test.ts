@@ -87,6 +87,9 @@ it("stop 中止当前 Run；Run 出错时推送 error；拒绝未列入的网页
   const t = await boot()
   const c = await t.connect("http://localhost:5173")
   await expect(t.connect("https://evil.example")).rejects.toThrow()
+  await expect(t.connect("null")).rejects.toThrow()
+  const electron = await t.connect("file://")
+  electron.ws.close()
 
   t.faux.setResponses([fauxAssistantMessage([], { stopReason: "error", errorMessage: "invalid api key" })])
   c.send({ type: "say", text: "在吗" })

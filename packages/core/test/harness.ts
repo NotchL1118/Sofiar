@@ -88,11 +88,12 @@ export function setup(
   const faux = fauxProvider(o.faux)
   const models = createModels()
   models.setProvider(faux.provider)
+  const runtime = createModelRuntime(models, { main: { model: faux.getModel() } })
   const home = o.home ?? mkdtempSync(join(tmpdir(), "sofia-test-"))
   const kernel = createKernel({
     home,
     dbPath: o.dbPath ?? ":memory:",
-    models: createModelRuntime(models, { main: { model: faux.getModel() } }),
+    models: runtime,
     config: { retry: { maxRetries: 3, baseDelayMs: 1 }, ...o.config },
     extensions: (o.extensions ?? []).map((e) => ("setup" in e ? { def: e } : e)),
   })
@@ -111,7 +112,7 @@ export function setup(
       }),
     )
   const of = <T extends SofiaEvent["type"]>(type: T) => events.filter((e): e is Extract<SofiaEvent, { type: T }> => e.type === type)
-  return { kernel, faux, home, events, of, requests, reply, entries: (types?: string[]) => kernel.timeline.query(types ? { types } : {}) }
+  return { kernel, runtime, faux, home, events, of, requests, reply, entries: (types?: string[]) => kernel.timeline.query(types ? { types } : {}) }
 }
 
 /** 一次请求里全部 user 文本 */

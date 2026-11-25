@@ -54,21 +54,19 @@ export function estimateMessageTokens(message: AgentMessage): number {
   }
 }
 
-/** 上下文 token 估算：最近一次成功 assistant 的 usage + 其后新增内容的估算。 */
-export function estimateContextTokens(messages: readonly AgentMessage[]): number {
+/** 从压缩后的首个可用下标寻找最近一次有效 usage；尚无实测用量时估算整个上下文。 */
+export function estimateContextTokens(messages: readonly AgentMessage[], usageStartIndex = 0): number {
+  let tail = 0
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]!
-    if (m.role !== "assistant" || m.stopReason === "error" || m.stopReason === "aborted") continue
-    const u = m.usage
-    const used = u.totalTokens || u.input + u.output + u.cacheRead + u.cacheWrite
-    if (used <= 0) continue
-    let tail = 0
-    for (let j = i + 1; j < messages.length; j++) tail += estimateMessageTokens(messages[j]!)
-    return used + tail
+    if (i >= usageStartIndex && m.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted") {
+      const u = m.usage
+      const used = u.totalTokens || u.input + u.output + u.cacheRead + u.cacheWrite
+      if (used > 0) return used + tail
+    }
+    tail += estimateMessageTokens(m)
   }
-  let total = 0
-  for (const m of messages) total += estimateMessageTokens(m)
-  return total
+  return tail
 }
 
 /**

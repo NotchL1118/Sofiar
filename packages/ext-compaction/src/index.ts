@@ -7,7 +7,7 @@ import { resolve } from "node:path"
 import { defineExtension, renderEntries } from "@sofia/core"
 
 export interface CompactionConfig {
-  /** Model Role，默认 cheap（未配置时内核回退到 main） */
+  /** 用于摘要的 Model Role，默认 main。可指定 cheap 等其他角色。 */
   role?: string
   /** 覆盖摘要的系统提示词 */
   prompt?: string
@@ -34,7 +34,7 @@ export default defineExtension<CompactionConfig>({
   configSchema: {
     type: "object",
     properties: {
-      role: { type: "string", description: "用于摘要的 Model Role，默认 cheap" },
+      role: { type: "string", description: "用于摘要的 Model Role，默认 main，可指定 cheap 等其他角色" },
       prompt: { type: "string", description: "覆盖摘要的系统提示词" },
       promptFile: { type: "string", description: "从文件读取摘要提示词（相对数据目录）" },
     },
@@ -64,7 +64,7 @@ export default defineExtension<CompactionConfig>({
         .filter(Boolean)
         .join("\n\n")
       const reply = await sofia.complete(
-        config.role ?? "cheap",
+        config.role ?? "main",
         { systemPrompt: systemPrompt(), messages: [{ role: "user", content: user, timestamp: Date.now() }] },
         { signal },
       )
@@ -72,6 +72,7 @@ export default defineExtension<CompactionConfig>({
       if (reply.stopReason === "error" || reply.stopReason === "aborted") {
         throw new Error(reply.errorMessage ?? `summary request ${reply.stopReason}`)
       }
+      if (reply.stopReason === "length") throw new Error("summary reached the output token limit")
       const summary = reply.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("\n").trim()
       if (summary === "") throw new Error("summary model returned no text")
       return { summary }

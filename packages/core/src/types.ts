@@ -242,14 +242,25 @@ export interface ExtensionInfo {
 export interface SofiaConfig {
   providers?: Record<string, unknown>
   models?: Record<string, { provider: string; id: string; thinking?: ThinkingLevel }>
-  kernel?: Partial<KernelConfig>
+  kernel?: Partial<Omit<KernelConfig, "compaction" | "retry">> & {
+    compaction?: Partial<KernelConfig["compaction"]>
+    retry?: Partial<KernelConfig["retry"]>
+  }
   extensions?: { use: string; enabled?: boolean; config?: unknown }[]
+}
+
+export interface CompactionBudget {
+  reserveTokens: number
+  keepRecentTokens: number
 }
 
 export interface KernelConfig {
   /** 单个 Run 的 Turn 上限；null 为不限制 */
   maxTurnsPerRun: number | null
-  compaction: { reserveTokens: number; keepRecentTokens: number }
+  compaction: CompactionBudget & {
+    /** 精确匹配主模型的 provider/modelId，每个未指定的字段继承全局值。 */
+    modelOverrides?: Record<string, Partial<CompactionBudget>>
+  }
   /** 被 await 的 hook 的超时（ms） */
   hookTimeoutMs: number
   /** before_compact / compacted 的超时（ms） */

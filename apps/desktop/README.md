@@ -50,7 +50,7 @@ daemon → 客户端
 - **断线**：自动重连并重发 `hello`。断开期间的回复不补发。
 - 多个客户端可同时连接，都会收到广播；表情/动作以最近一次 `hello` 为准，全部断开后工具注销。
 
-连接限制：只监听 `127.0.0.1`；带 `http(s)://` Origin 的连接（即普通网页）默认拒绝，开发服务器的来源要加进 ext-desktop 的 `allowedOrigins`。Electron 的 `file://` 页面和本地脚本不受限。
+只监听 `127.0.0.1`。默认接受 Electron 的 `file://` 来源和省略 Origin 的本地客户端。网页开发服务器需将完整的 HTTP(S) 来源加入 ext-desktop 的 `allowedOrigins`。来源为 `null` 的页面会被拒绝。
 
 ## 接入 Live2D（下一步）
 

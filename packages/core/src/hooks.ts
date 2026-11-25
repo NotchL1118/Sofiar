@@ -3,6 +3,7 @@
  * - hook 按扩展加载顺序串行执行；抛异常或超时的 handler 被跳过，不影响主流程。
  * - 事件流订阅者的异常被吞掉。
  */
+import { addAbortListener } from "node:events"
 import type { HookHandler, HookMap, HookName, SofiaEvent, SofiaEventInput } from "./types.ts"
 
 export class EventBus {
@@ -41,8 +42,6 @@ export interface HookOutcome {
   errors: string[]
 }
 
-const TIMEOUT = Symbol("timeout")
-
 export class HookBus {
   private readonly handlers = new Map<HookName, Registration[]>()
   private seq = 0
@@ -74,36 +73,40 @@ export class HookBus {
    */
   async run<E extends HookName>(
     event: E,
-    payload: () => HookMap[E]["payload"],
+    payload: (signal: AbortSignal) => HookMap[E]["payload"],
     opts: {
       timeoutMs: number
       onResult?: (result: Exclude<HookMap[E]["result"], void>, ext: string) => "stop" | void
-      onTimeout?: () => void
+      signal?: AbortSignal
     },
   ): Promise<HookOutcome> {
     const outcome: HookOutcome = { failed: 0, errors: [] }
     for (const reg of [...(this.handlers.get(event) ?? [])]) {
+      if (opts.signal?.aborted) break
       const startedAt = performance.now()
       let error: string | undefined
       let stop = false
-      let timer: ReturnType<typeof setTimeout> | undefined
+      const timeout = new AbortController()
+      const signal = opts.signal ? AbortSignal.any([opts.signal, timeout.signal]) : timeout.signal
+      const cancelled = Promise.withResolvers<never>()
+      const listener = addAbortListener(signal, () => cancelled.reject(signal.reason))
+      const timer = setTimeout(() => timeout.abort(new Error("timeout")), opts.timeoutMs)
       try {
         const result = await Promise.race([
-          Promise.resolve().then(() => reg.handler(payload())),
-          new Promise<typeof TIMEOUT>((resolve) => {
-            timer = setTimeout(() => resolve(TIMEOUT), opts.timeoutMs)
+          Promise.resolve().then(() => {
+            signal.throwIfAborted()
+            return reg.handler(payload(signal))
           }),
+          cancelled.promise,
         ])
-        if (result === TIMEOUT) {
-          error = "timeout"
-          opts.onTimeout?.()
-        } else if (result !== undefined && result !== null && opts.onResult) {
+        if (result !== undefined && result !== null && opts.onResult) {
           stop = opts.onResult(result as Exclude<HookMap[E]["result"], void>, reg.ext) === "stop"
         }
       } catch (e) {
         error = e instanceof Error ? e.message : String(e)
       } finally {
         clearTimeout(timer)
+        listener[Symbol.dispose]()
       }
       if (error !== undefined) {
         outcome.failed++

@@ -10,19 +10,18 @@ import { Agent, type AgentEvent, type AgentMessage, type AgentTool } from "@eare
 import {
   type AssistantMessage,
   getCurrentSystemMessage,
-  getCurrentTools,
   getToolStateChanges,
   isContextOverflow,
   type SystemMessage,
   toToolDeclaration,
   uuidv7,
 } from "@earendil-works/pi-ai"
-import { estimateContextTokens, estimateMessageTokens, findCut } from "./compaction.ts"
+import { estimateContextTokens, findCut } from "./compaction.ts"
 import { EventBus, HookBus } from "./hooks.ts"
 import { bucketKey, type Pick, SignalQueue } from "./queue.ts"
 import { convertToLlm, couldBecomeSilence, isSilence, KERNEL_SECTION, notices } from "./render.ts"
 import { withRetry } from "./stream.ts"
-import { messageToEntry, Timeline } from "./timeline.ts"
+import { type LoadedContext, messageToEntry, Timeline } from "./timeline.ts"
 import {
   type ChannelDef,
   type CompactionReason,
@@ -42,6 +41,7 @@ import {
   type Signal,
   type SignalInput,
   type SofiaAPI,
+  type SofiaConfig,
   type SofiaEvent,
   TOOL_NAME_RE,
   validateExtensionConfig,
@@ -65,10 +65,7 @@ export interface KernelOptions {
   /** 默认 `<home>/timeline.db`；测试可传 ":memory:" */
   dbPath?: string
   models: ModelRuntime
-  config?: Partial<Omit<KernelConfig, "compaction" | "retry">> & {
-    compaction?: Partial<KernelConfig["compaction"]>
-    retry?: Partial<KernelConfig["retry"]>
-  }
+  config?: SofiaConfig["kernel"]
   /** 有序：顺序决定 hook 执行顺序与 Section 顺序 */
   extensions?: { def: ExtensionDef<any>; config?: unknown; use?: string }[]
   host?: HostAPI
@@ -84,6 +81,8 @@ interface ActiveRun {
   turn: number
   turnsDone: number
   turnLimitHit: boolean
+  /** 当前 loop 上下文中，第一条可使用主模型 usage 的消息下标。 */
+  usageStartIndex: number
   lastAssistant: AssistantMessage | undefined
   /** 当前 assistant 消息的流式文本与是否已放行（Silence Token 前缀扣留） */
   stream: { text: string; released: boolean }
@@ -218,9 +217,10 @@ export class Kernel {
         const messages: AgentMessage[] = run.pendingNotices
           .splice(0)
           .map((text) => ({ role: "notice", text, timestamp: Date.now() }))
-        const compacted = this.overThreshold(turn.context.messages) && (await this.compact("threshold"))
-        if (!compacted) return messages.length > 0 ? { messages } : undefined
-        return { context: { messages: this.timeline.loadContext().messages, tools: turn.context.tools ?? [] }, messages }
+        const rebuilt = this.overThreshold(turn.context.messages, run.usageStartIndex) && (await this.compact("threshold"))
+        if (!rebuilt) return messages.length > 0 ? { messages } : undefined
+        run.usageStartIndex = rebuilt.usageStartIndex
+        return { context: { messages: rebuilt.messages, tools: turn.context.tools ?? [] }, messages }
       },
     })
     this.agent.subscribe((event) => this.onAgentEvent(event))
@@ -243,19 +243,8 @@ export class Kernel {
     if (ctx.missingCheckpoint) {
       this.writeCheckpoint(ctx.messages, undefined)
     } else {
-      const sections = this.sectionPatch("rebuild", ctx.messages)
-      const tools = getToolStateChanges(getCurrentTools(ctx.messages), this.toolList().map(toToolDeclaration))
-      if (sections || tools.toolsAdded.length > 0 || tools.toolsRemoved.length > 0) {
-        const patch: SystemMessage = {
-          role: "system",
-          content: "",
-          ...(sections ? { sections } : {}),
-          ...(tools.toolsAdded.length > 0 ? { toolsAdded: tools.toolsAdded } : {}),
-          ...(tools.toolsRemoved.length > 0 ? { toolsRemoved: tools.toolsRemoved } : {}),
-          timestamp: Date.now(),
-        }
-        this.persist(patch, undefined)
-      }
+      const patch = this.systemPatch("rebuild", ctx.messages)
+      if (patch) this.persist(patch, undefined)
     }
 
     await this.hooks.run("start", () => undefined, { timeoutMs: this.cfg.hookTimeoutMs })
@@ -268,7 +257,8 @@ export class Kernel {
     if (this.stopping) return
     this.stopping = true
     this.queue.clear()
-    this.abortRun("shutdown")
+    if (this.run) this.abortRun("shutdown")
+    else this.compactAbort?.abort()
     while (this.run || this.compacting) await new Promise<void>((resolve) => this.idleWaiters.push(resolve))
     await Promise.allSettled([...this.deliveries.values()])
     await this.hooks.run("shutdown", () => ({ reason }), { timeoutMs: this.cfg.hookTimeoutMs })
@@ -389,6 +379,7 @@ export class Kernel {
       turn: 0,
       turnsDone: 0,
       turnLimitHit: false,
+      usageStartIndex: 0,
       lastAssistant: undefined,
       stream: { text: "", released: false },
       pendingNotices: [],
@@ -406,15 +397,9 @@ export class Kernel {
       this.agent.state.thinkingLevel = main.thinking ?? "off"
 
       let ctx = this.timeline.loadContext()
-      if (this.overThreshold([...ctx.messages, ...signalMessages]) && (await this.compact("threshold"))) {
-        ctx = this.timeline.loadContext()
-      }
-      this.agent.state.messages = ctx.messages
       this.agent.state.tools = this.toolList()
-
       const prompt: AgentMessage[] = []
-      const sections = this.sectionPatch("run", ctx.messages)
-      if (sections) prompt.push({ role: "system", content: "", sections, timestamp: Date.now() })
+      let patch = this.systemPatch("run", ctx.messages, this.agent.state.tools)
 
       await this.hooks.run("run_start", () => ({ run: info, signals: pick.signals }), {
         timeoutMs: this.cfg.hookTimeoutMs,
@@ -425,7 +410,19 @@ export class Kernel {
       })
       prompt.push(...signalMessages)
 
+      const candidate = patch ? [...ctx.messages, patch, ...prompt] : [...ctx.messages, ...prompt]
+      if (run.aborted === undefined && this.overThreshold(candidate, ctx.usageStartIndex)) {
+        const rebuilt = await this.compact("threshold")
+        if (rebuilt) {
+          ctx = rebuilt
+          // compacted 可更新 Section；旧补丁只能用于估算，发送时以新检查点为准。
+          patch = this.systemPatch("run", ctx.messages, this.agent.state.tools)
+        }
+      }
       if (run.aborted === undefined) {
+        run.usageStartIndex = ctx.usageStartIndex
+        this.agent.state.messages = ctx.messages
+        if (patch) prompt.unshift(patch)
         prompted = true
         await this.agent.prompt(prompt)
         await this.recoverFromOverflow(run, main.model.contextWindow)
@@ -444,11 +441,12 @@ export class Kernel {
     const last = run.lastAssistant
     if (!last || last.stopReason !== "error" || run.aborted !== undefined) return
     if (!isContextOverflow(last, contextWindow)) return
-    if (!(await this.compact("overflow"))) return
-    const rebuilt = this.timeline.loadContext().messages
-    const tail = rebuilt[rebuilt.length - 1]
-    if (!tail || tail.role === "assistant" || rebuilt.every((m) => m.role === "system")) return
-    this.agent.state.messages = rebuilt
+    const rebuilt = await this.compact("overflow")
+    if (!rebuilt || run.aborted !== undefined) return
+    const tail = rebuilt.messages.at(-1)
+    if (!tail || tail.role === "assistant" || rebuilt.messages.every((m) => m.role === "system")) return
+    run.usageStartIndex = rebuilt.usageStartIndex
+    this.agent.state.messages = rebuilt.messages
     run.lastAssistant = undefined
     await this.agent.continue()
   }
@@ -681,14 +679,25 @@ export class Kernel {
     return target
   }
 
-  /** 与当前 system 状态 diff；无变化返回 undefined（不产生补丁，保护 prompt cache）。 */
-  private sectionPatch(reason: "run" | "rebuild", messages: AgentMessage[]): Record<string, string | null> | undefined {
-    const current = getCurrentSystemMessage(messages)?.sections ?? {}
+  /** 计算本次请求的 Section 与工具增量，供 token 估算和实际发送共用。 */
+  private systemPatch(reason: "run" | "rebuild", messages: AgentMessage[], tools?: AgentTool<any>[]): SystemMessage | undefined {
+    const system = getCurrentSystemMessage(messages)
+    const current = system?.sections ?? {}
     const target = this.computeSections(reason, current)
     const patch: Record<string, string | null> = {}
     for (const [name, value] of Object.entries(target)) if (current[name] !== value) patch[name] = value
     for (const name of Object.keys(current)) if (!(name in target) && current[name] !== null) patch[name] = null
-    return Object.keys(patch).length > 0 ? patch : undefined
+    const { toolsAdded, toolsRemoved } = getToolStateChanges(system?.toolsAdded ?? [], (tools ?? this.toolList()).map(toToolDeclaration))
+    const hasSections = Object.keys(patch).length > 0
+    if (!hasSections && toolsAdded.length === 0 && toolsRemoved.length === 0) return undefined
+    return {
+      role: "system",
+      content: "",
+      ...(hasSections ? { sections: patch } : {}),
+      ...(toolsAdded.length > 0 ? { toolsAdded } : {}),
+      ...(toolsRemoved.length > 0 ? { toolsRemoved } : {}),
+      timestamp: Date.now(),
+    }
   }
 
   /** 全量 system 检查点：Compaction 之后、重建上下文的第一条。 */
@@ -708,26 +717,43 @@ export class Kernel {
 
   // ═══════════════════════════ Compaction（§7.3） ═══════════════════════════
 
-  private overThreshold(messages: readonly AgentMessage[]): boolean {
-    const window = this.options.models.resolve("main").model.contextWindow
-    if (!window || window <= 0) return false
-    return estimateContextTokens(messages) > window - this.cfg.compaction.reserveTokens
+  private compactionBudget() {
+    const model = this.run ? this.agent.state.model : this.options.models.resolve("main").model
+    const config = this.cfg.compaction
+    const override = config.modelOverrides?.[`${model.provider}/${model.id}`]
+    return {
+      contextWindow: model.contextWindow,
+      reserveTokens: override?.reserveTokens ?? config.reserveTokens,
+      keepRecentTokens: override?.keepRecentTokens ?? config.keepRecentTokens,
+    }
   }
 
-  /** 触发与记账；摘要由 `before_compact` 提供。返回是否真的压缩了。 */
-  private async compact(reason: CompactionReason): Promise<boolean> {
+  private overThreshold(messages: readonly AgentMessage[], usageStartIndex: number): boolean {
+    const { contextWindow, reserveTokens } = this.compactionBudget()
+    if (!contextWindow || contextWindow <= 0) return false
+    return estimateContextTokens(messages, usageStartIndex) > contextWindow - reserveTokens
+  }
+
+  /** 触发与记账；摘要由 `before_compact` 提供。成功时返回重建后的上下文。 */
+  private async compact(reason: CompactionReason): Promise<LoadedContext | undefined> {
     const run = this.run
     const ctx = this.timeline.loadContext()
-    const tokensBefore = estimateContextTokens(ctx.messages)
+    const tokensBefore = estimateContextTokens(ctx.messages, ctx.usageStartIndex)
     const fail = (error: string, by?: string) => {
       this.emit({ type: "compaction", reason, ok: false, tokensBefore, error, ...(by === undefined ? {} : { by }) })
-      return false
+      return undefined
     }
 
-    const cut = findCut(ctx.entries, this.cfg.compaction.keepRecentTokens)
+    let cut = findCut(ctx.entries, this.compactionBudget().keepRecentTokens)
+    const runStart = run ? ctx.entries.findIndex((e) => e.runId === run.info.id) : -1
+    if (runStart >= 0 && cut > runStart) {
+      // 保住待回答的首批输入，或最近的 assistant 及其全部工具结果、后续输入。
+      const lastAssistant = ctx.entries.findLastIndex((e) => e.type === "assistant")
+      cut = Math.min(cut, Math.max(runStart, lastAssistant))
+    }
     if (cut === 0) return fail("nothing to compact")
-    const entries = ctx.entries.slice(0, cut)
-    const firstKeptSeq = ctx.entries[cut]?.seq ?? this.timeline.lastSeq() + 1
+    let entries = ctx.entries.slice(0, cut)
+    let firstKeptSeq = ctx.entries[cut]?.seq ?? this.timeline.lastSeq() + 1
 
     const abort = new AbortController()
     this.compactAbort = abort
@@ -738,10 +764,10 @@ export class Kernel {
     try {
       outcome = await this.hooks.run(
         "before_compact",
-        () => ({ entries, previousSummary: ctx.previousSummary, tokensBefore, reason, signal: abort.signal }),
+        (signal) => ({ entries, previousSummary: ctx.previousSummary, tokensBefore, reason, signal }),
         {
           timeoutMs: this.cfg.compactHookTimeoutMs,
-          onTimeout: () => abort.abort(),
+          signal: abort.signal,
           onResult: (r, ext) => {
             if ("cancel" in r) {
               if (!r.cancel) return
@@ -758,12 +784,17 @@ export class Kernel {
     } finally {
       this.compactAbort = undefined
     }
+    if (abort.signal.aborted) return fail("aborted")
     if (cancelledBy !== undefined) return fail("cancelled", cancelledBy)
-    if (run?.aborted !== undefined) return fail("aborted")
     if (summary === undefined) {
       // 摘要失败：本次不压缩、上下文不变，下一个检查点自然会再次触发
       if (outcome.failed > 0) return fail(outcome.errors.join("; "))
-      // 没有任何扩展处理：沿用旧摘要、丢弃切点之前的内容，保证不会超出窗口
+      // 旧摘要没有记录当前 Run，兜底时只能丢弃更早的 Run。
+      if (runStart >= 0 && cut > runStart) {
+        if (runStart === 0) return fail("nothing to compact")
+        entries = ctx.entries.slice(0, runStart)
+        firstKeptSeq = ctx.entries[runStart]!.seq
+      }
       summary = ctx.previousSummary ?? ""
     }
 
@@ -777,9 +808,10 @@ export class Kernel {
     await this.hooks.run("compacted", () => ({ entries, summary: finalSummary }), { timeoutMs: this.cfg.compactHookTimeoutMs })
     this.writeCheckpoint(ctx.messages, run)
 
-    const tokensAfter = this.timeline.loadContext().messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0)
+    const rebuilt = this.timeline.loadContext()
+    const tokensAfter = estimateContextTokens(rebuilt.messages, rebuilt.usageStartIndex)
     this.emit({ type: "compaction", reason, ok: true, tokensBefore, tokensAfter, ...(by === undefined ? {} : { by }) })
-    return true
+    return rebuilt
   }
 
   // ═══════════════════════════ Extension（§8） ═══════════════════════════

@@ -38,10 +38,12 @@ export function sofiaHome(): string {
 }
 
 function readJson(path: string): unknown {
+  const contents = readFileSync(path, "utf8")
   try {
-    return JSON.parse(readFileSync(path, "utf8"))
-  } catch (e) {
-    throw new Error(`${path}: ${e instanceof Error ? e.message : String(e)}`)
+    return JSON.parse(contents)
+  } catch {
+    // JSON.parse 的错误可能带有文件原文，尤其不能把 secrets.json 的片段写入日志。
+    throw new Error(`${path}: invalid JSON`)
   }
 }
 
@@ -68,6 +70,34 @@ export function writeConfig(home: string, config: SofiaConfig): void {
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v)
+
+function checkCompaction(config: unknown): string[] {
+  const path = "kernel.compaction"
+  if (!isObject(config)) return [`${path} must be an object`]
+  const problems: string[] = []
+  const checkBudget = (budget: Record<string, unknown>, at: string) => {
+    for (const key of ["reserveTokens", "keepRecentTokens"]) {
+      const value = budget[key]
+      if (value !== undefined && (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)) {
+        problems.push(`${at}.${key} must be a non-negative safe integer`)
+      }
+    }
+  }
+  checkBudget(config, path)
+  const overrides = config.modelOverrides
+  if (overrides === undefined) return problems
+  if (!isObject(overrides)) return [...problems, `${path}.modelOverrides must be an object`]
+  for (const [model, budget] of Object.entries(overrides)) {
+    const at = `${path}.modelOverrides[${JSON.stringify(model)}]`
+    const slash = model.indexOf("/")
+    if (slash < 1 || !model.slice(0, slash).trim() || !model.slice(slash + 1).trim()) {
+      problems.push(`${at} key must be provider/modelId`)
+    }
+    if (isObject(budget)) checkBudget(budget, at)
+    else problems.push(`${at} must be an object`)
+  }
+  return problems
+}
 
 export function isBuiltinProvider(name: string): boolean {
   return (getBuiltinProviders() as string[]).includes(name)
@@ -123,6 +153,9 @@ export function checkConfig(config: unknown): string[] {
     }
   }
 
+  if (isObject(config.kernel) && config.kernel.compaction !== undefined) {
+    problems.push(...checkCompaction(config.kernel.compaction))
+  }
   if (config.extensions !== undefined && !Array.isArray(config.extensions)) problems.push("extensions must be an array")
   for (const [i, ext] of (Array.isArray(config.extensions) ? config.extensions : []).entries()) {
     if (!isObject(ext) || typeof ext.use !== "string" || ext.use === "") problems.push(`extensions[${i}].use is required`)

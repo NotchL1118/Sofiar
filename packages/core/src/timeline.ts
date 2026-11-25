@@ -97,6 +97,8 @@ function isFailedAssistant(entry: TimelineEntry): boolean {
 /** 从 Timeline 重建出的工作上下文。 */
 export interface LoadedContext {
   messages: AgentMessage[]
+  /** 从这个消息下标起，assistant 的 usage 才对应最近一次压缩后的上下文。未压缩时为 0。 */
+  usageStartIndex: number
   /** 进入上下文的非 system 条目（已剔除 error/aborted assistant），按 seq 正序；供切点计算。 */
   entries: TimelineEntry[]
   previousSummary: string | undefined
@@ -226,7 +228,7 @@ export class Timeline {
 
     if (!compaction) {
       for (const entry of rows) push(entry)
-      return { messages, entries, previousSummary: undefined, missingCheckpoint: false }
+      return { messages, usageStartIndex: 0, entries, previousSummary: undefined, missingCheckpoint: false }
     }
 
     const kept = rows.filter((e) => e.seq < compaction.seq && e.type !== "system")
@@ -238,8 +240,9 @@ export class Timeline {
     if (checkpoint) push(checkpoint)
     messages.push(summary)
     for (const entry of kept) push(entry)
+    const usageStartIndex = messages.length
     for (const entry of after) push(entry)
-    return { messages, entries, previousSummary: compaction.data.summary, missingCheckpoint: !checkpoint }
+    return { messages, usageStartIndex, entries, previousSummary: compaction.data.summary, missingCheckpoint: !checkpoint }
   }
 }
 
